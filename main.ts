@@ -1,8 +1,23 @@
 async function main() {
   const asmText = trimSub(await Deno.readTextFile("MS-DOS/v1.25/source/ASM.ASM"));
   const tokens = tokenize(asmText);
-  const lines = parseLines(tokens);
-  let cText = "int main() {\n";
+  const origLines = parseLines(tokens);
+  const [lines, consts] = extractConstants(origLines);
+  let cText = "";
+  for (const constDecl of consts.values()) {
+    for (const leadingComment of constDecl.leadingComments) {
+      cText += `// ${leadingComment}\n`;
+    }
+    cText += `const int ${constDecl.name} = ${stringifyOperandAsC(constDecl.value)};`;
+    if (constDecl.trailingComments.length > 0) {
+      cText += " //";
+      for (const trailingComment of constDecl.trailingComments) {
+        cText += ` ${trailingComment}`;
+      }
+    }
+    cText += "\n";
+  }
+  cText += "int main() {\n";
   for (const line of lines) {
     for (const leadingComment of line.leadingComments) {
       cText += `  // ${leadingComment}\n`;
@@ -184,7 +199,7 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         operands,
         line: mnemonicToken.line,
         leadingComments: mnemonicToken.leadingComments,
-        trailingComments: mnemonicToken.trailingComments,
+        trailingComments: tokens[i - 1].trailingComments,
       });
     } else if (tokens[i].text === "\n") {
       i++;
@@ -308,6 +323,67 @@ function stringifyOperandNoParen(operand: Operand): string {
       return `${stringifyOperand(operand.lhs, 2)} ${operand.op} ${stringifyOperand(operand.rhs, 1)}`;
     case "UnOpOperand":
       return `${operand.op}${stringifyOperand(operand.arg, 2)}`;
+  }
+}
+
+type Constant = {
+  name: string;
+  value: Operand;
+  line: number;
+  leadingComments: string[];
+  trailingComments: string[];
+};
+
+function extractConstants(lines: (Label | Instruction)[]): [(Label | Instruction)[], Map<string, Constant>] {
+  const newLines: (Label | Instruction)[] = [];
+  const consts: Map<string, Constant> = new Map();
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.type === "Label" && i + 1 < lines.length) {
+      const nextLine = lines[i + 1];
+      if (nextLine.type === "Instruction" && /^equ$/i.test(nextLine.mnemonic) && nextLine.operands.length > 0) {
+        consts.set(line.name, {
+          name: line.name,
+          value: nextLine.operands[0],
+          line: nextLine.line,
+          leadingComments: [...line.leadingComments, ...nextLine.leadingComments],
+          trailingComments: [...line.trailingComments, ...nextLine.trailingComments],
+        });
+        i++;
+        continue;
+      }
+    }
+    newLines.push(line);
+  }
+  return [newLines, consts];
+}
+
+function stringifyOperandAsC(operand: Operand, level = 2): string {
+  const [body, innerLevel] = stringifyOperandAsCNoParen(operand);
+  if (innerLevel <= level) {
+    return body;
+  } else {
+    return `(${body})`;
+  }
+}
+function stringifyOperandAsCNoParen(operand: Operand): [string, number] {
+  switch (operand.type) {
+    case "SimpleOperand":
+      if (/^[A-Za-z]/.test(operand.value)) {
+        return [operand.value, 1];
+      } else if (/^[0-9]+$/.test(operand.value)) {
+        return [operand.value.replace(/^0+(?=[1-9])/, ""), 1];
+      } else if (/^[0-9A-F]+H$/i.test(operand.value)) {
+        return [`0x${operand.value.slice(0, operand.value.length - 1)}`, 1];
+      } else {
+        return [`asm("${escapeC(operand.value)}")`, 1];
+      }
+    case "IndirectOperand":
+      return [`[${stringifyOperandAsC(operand, 2)}]`, 1];
+    case "BinOpOperand":
+      return [`${stringifyOperandAsC(operand.lhs, 2)} ${operand.op} ${stringifyOperandAsC(operand.rhs, 1)}`, 2];
+    case "UnOpOperand":
+      return [`${operand.op}${stringifyOperandAsC(operand.arg, 2)}`, 2];
   }
 }
 
