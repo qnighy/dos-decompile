@@ -5,7 +5,7 @@ async function main() {
   const [lines, consts] = extractConstants(origLines);
   const [instructions, labels, inverseLabels] = analyzeLabels(lines);
   const writesFrom = analyzeWrites(instructions, labels);
-  const livenessTable = analyzeLiveness(instructions, labels, writesFrom);
+  const { instructionLiveness: livenessTable, functionReturns } = analyzeLiveness(instructions, labels, writesFrom);
 
   let cText = "";
   for (const constDecl of consts.values()) {
@@ -23,6 +23,9 @@ async function main() {
   }
   cText += "int main() {\n";
   for (let i = 0; i < instructions.length; i++) {
+    if (functionReturns.has(i)) {
+      cText += `// returns: ${Array.from(functionReturns.get(i)!).join(", ")}\n`;
+    }
     for (const label of inverseLabels.get(i) || []) {
       for (const leadingComment of label.leadingComments) {
         cText += `  // ${leadingComment}\n`;
@@ -740,21 +743,25 @@ function inspectWrites(writeData: WriteData): string {
   return regEntries.join(", ");
 }
 
-type Liveness = {
+type LivenessResult = {
+  instructionLiveness: InstructionLiveness[];
+  functionReturns: Map<number, Set<string>>;
+};
+type InstructionLiveness = {
   liveBefore: Set<string>;
 };
 
-function analyzeLiveness(instructions: Instruction[], labels: Map<string, number>, writesFrom: WriteData[]): Liveness[] {
+function analyzeLiveness(instructions: Instruction[], labels: Map<string, number>, writesFrom: WriteData[]): LivenessResult {
+  const functionEntries: Set<number> = new Set();
   const returnOriginMap: Map<number, number[]> = new Map();
   const callOriginMap: Map<number, number[]> = new Map();
   {
-    const processedCalls: Set<number> = new Set();
     // deno-lint-ignore no-inner-declarations
     function processCall(i: number) {
-      if (processedCalls.has(i)) {
+      if (functionEntries.has(i)) {
         return;
       }
-      processedCalls.add(i);
+      functionEntries.add(i);
       const returns = writesFrom[i].returnsAt;
       for (const ret of returns) {
         if (returnOriginMap.has(ret)) {
@@ -782,15 +789,35 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
       }
     }
   }
-  const livenessTable: Liveness[] = Array.from({ length: instructions.length }, () => ({ liveBefore: new Set() }));
+  const livenessTable: InstructionLiveness[] = Array.from({ length: instructions.length }, () => ({ liveBefore: new Set() }));
+
+  function computeFunctionReturns(): Map<number, Set<string>> {
+    const functionReturns: Map<number, Set<string>> = new Map();
+    for (const functionEntry of functionEntries) {
+      const returnedRegs: Set<string> = new Set();
+      const functionWrites = writesFrom[functionEntry].writes;
+      for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
+        const innerLiveness = livenessTable[callIndex + 1].liveBefore;
+        for (const reg of innerLiveness) {
+          if (functionWrites.has(reg)) {
+            returnedRegs.add(reg);
+          }
+        }
+      }
+      functionReturns.set(functionEntry, returnedRegs);
+    }
+    return functionReturns;
+  }
+
   let changed = true;
   while (changed) {
     changed = false;
+    const functionReturns = computeFunctionReturns();
     for (let i = instructions.length - 1; i >= 0; i--) {
       const instruction = instructions[i];
       const livenessHere = livenessTable[i];
-      const livenessNext: Liveness = i + 1 < instructions.length ? livenessTable[i + 1] : { liveBefore: new Set() };
-      let newLiveness: Liveness | undefined = undefined;
+      const livenessNext: InstructionLiveness = i + 1 < instructions.length ? livenessTable[i + 1] : { liveBefore: new Set() };
+      let newLiveness: InstructionLiveness | undefined = undefined;
       switch (instruction.mnemonic) {
         case "mov": {
           break;
@@ -820,15 +847,9 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
         case "ret":
           newLiveness = { liveBefore: new Set() };
           for (const functionEntry of returnOriginMap.get(i) ?? []) {
-            const functionWrites = new Set(writesFrom[functionEntry].writes.keys());
-            for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
-              if (callIndex + 1 >= instructions.length) {
-                continue;
-              }
-              const innerLiveness = livenessTable[callIndex + 1].liveBefore.intersection(functionWrites);
-              for (const reg of innerLiveness) {
-                newLiveness.liveBefore.add(reg);
-              }
+            const returnedRegs = functionReturns.get(functionEntry)!;
+            for (const reg of returnedRegs) {
+              newLiveness.liveBefore.add(reg);
             }
           }
           break;
@@ -938,7 +959,10 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
       }
     }
   }
-  return livenessTable;
+  return {
+    instructionLiveness: livenessTable,
+    functionReturns: computeFunctionReturns(),
+  };
 }
 
 const REG_NAMES: Set<string> = new Set([
