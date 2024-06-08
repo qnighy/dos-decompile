@@ -568,9 +568,7 @@ function pushWrites(writeSrc: WriteData, offset: number, mapping: Record<string,
     }
   }
   for (const [key, value] of Object.entries(mapping)) {
-    if (!newWrites.has(key)) {
-      newWrites.set(key, value);
-    }
+    newWrites.set(key, value);
   }
   return { writes: newWrites };
 }
