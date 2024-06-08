@@ -915,7 +915,7 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
         //   break;
       }
       if (!newLiveness) {
-        newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
+        newLiveness = { liveBefore: new Set(decomposeCoverings(Array.from(livenessNext.liveBefore))) };
         const [src, dest] = instructionIO(instruction);
         for (const reg of expandCoverings(dest)) {
           newLiveness.liveBefore.delete(reg);
@@ -997,6 +997,19 @@ function expandCoverings(regs: string[]): string[] {
     }
   }
   return Array.from(subClosedRegs);
+}
+
+function decomposeCoverings(regs: string[]): string[] {
+  const result: Set<string> = new Set(regs);
+  for (const [superReg, subRegs] of REG_COVERINGS) {
+    if (result.has(superReg)) {
+      result.delete(superReg);
+      for (const sub of subRegs) {
+        result.add(sub);
+      }
+    }
+  }
+  return Array.from(result);
 }
 
 function expandAliases(reg: string[]): string[] {
