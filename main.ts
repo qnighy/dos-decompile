@@ -40,7 +40,7 @@ async function main() {
     for (const leadingComment of instruction.leadingComments) {
       cText += `  // ${leadingComment}\n`;
     }
-    cText += `  // writes: ${inspectWrites(writesFrom[i])}\n`;
+    // cText += `  // writes: ${inspectWrites(writesFrom[i])}\n`;
     cText += `  // liveness: ${Array.from(livenessTable[i].liveBefore).join(", ")}\n`;
     cText += `  asm("${escapeC(stringifyInstruction(instruction))}");`;
     if (instruction.trailingComments.length > 0) {
@@ -756,28 +756,9 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
       const livenessNext: Liveness = i + 1 < instructions.length ? livenessTable[i + 1] : { liveBefore: new Set() };
       let newLiveness: Liveness | undefined = undefined;
       switch (instruction.mnemonic) {
-        // case "mov": {
-        //   const dest = instruction.operands[0] && asRegister(instruction.operands[0]);
-        //   if (dest === "sp") {
-        //     newWriteData = { ...WriteData(), noReturn: true };
-        //   }
-        //   const src = instruction.operands[1] && asRegister(instruction.operands[1]);
-        //   if (dest && src && dest !== "sp") {
-        //     const thisInstr: WriteData = WriteData();
-        //     for (const reg of expandAliases([dest])) {
-        //       thisInstr.writes.set(reg, "any");
-        //     }
-        //     thisInstr.writes.set(dest, src);
-        //     for (const [key, destSub] of Object.entries(SUB_REGS.get(dest) ?? {})) {
-        //       const srcSub = SUB_REGS.get(src)?.[key];
-        //       if (srcSub) {
-        //         thisInstr.writes.set(destSub, srcSub);
-        //       }
-        //     }
-        //     newWriteData = composeWrites(thisInstr, nextWriteData);
-        //   }
-        //   break;
-        // }
+        case "mov": {
+          break;
+        }
         // case "xchg":
         //   break;
         // case "push": {
@@ -803,67 +784,72 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
         case "ret":
           newLiveness = { liveBefore: new Set() };
           break;
-        // case "jp": // Considered an unconditional jump here
-        // case "jmp":
-        // case "jmps":
-        //   if (instruction.operands.length === 1) {
-        //     const target = instruction.operands[0];
-        //     if (target.type === "SimpleOperand") {
-        //       const targetIndex = labels.get(target.value);
-        //       if (targetIndex !== undefined) {
-        //         newWriteData = writesFrom[targetIndex];
-        //       }
-        //     }
-        //   }
-        //   break;
-        // case "ja":
-        // case "jna":
-        // case "jbe":
-        // case "jnbe":
-        // case "jg":
-        // case "jng":
-        // case "jle":
-        // case "jnle":
-        // case "jge":
-        // case "jnge":
-        // case "jl":
-        // case "jnl":
-        // case "jo":
-        // case "jno":
-        // case "js":
-        // case "jns":
-        // case "je":
-        // case "jne":
-        // case "jz":
-        // case "jnz":
-        // // case "jp":
-        // case "jnp":
-        // case "jpe":
-        // case "jpo":
-        // case "jae":
-        // case "jnae":
-        // case "jb":
-        // case "jnb":
-        // case "jc":
-        // case "jnc": {
-        //   // Check condition flags
-        //   const thisInstr: WriteData = WriteData();
-        //   const [, dest] = instructionIO(instruction);
-        //   for (const reg of expandAliases(dest)) {
-        //     thisInstr.writes.set(reg, "any");
-        //   }
+        case "jp": // Considered an unconditional jump here
+        case "jmp":
+        case "jmps":
+          if (instruction.operands.length === 1) {
+            const target = instruction.operands[0];
+            if (target.type === "SimpleOperand") {
+              const targetIndex = labels.get(target.value);
+              if (targetIndex !== undefined) {
+                newLiveness = { liveBefore: new Set(livenessTable[targetIndex].liveBefore) };
+              }
+            }
+          }
+          break;
+        case "ja":
+        case "jna":
+        case "jbe":
+        case "jnbe":
+        case "jg":
+        case "jng":
+        case "jle":
+        case "jnle":
+        case "jge":
+        case "jnge":
+        case "jl":
+        case "jnl":
+        case "jo":
+        case "jno":
+        case "js":
+        case "jns":
+        case "je":
+        case "jne":
+        case "jz":
+        case "jnz":
+        // case "jp":
+        case "jnp":
+        case "jpe":
+        case "jpo":
+        case "jae":
+        case "jnae":
+        case "jb":
+        case "jnb":
+        case "jc":
+        case "jnc": {
+          newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
+          // Check condition flags
+          const [, dest] = instructionIO(instruction);
+          for (const reg of expandCoverings(dest)) {
+            newLiveness.liveBefore.add(reg);
+          }
 
-        //   if (instruction.operands.length === 1) {
-        //     const target = instruction.operands[0];
-        //     if (target.type === "SimpleOperand") {
-        //       const targetIndex = labels.get(target.value);
-        //       if (targetIndex !== undefined) {
-        //         newWriteData = composeWrites(thisInstr, mergeWrites(nextWriteData, writesFrom[targetIndex]));
-        //       }
-        //     }
-        //   }
-        //   break;
-        // }
+          if (instruction.operands.length === 1) {
+            const target = instruction.operands[0];
+            if (target.type === "SimpleOperand") {
+              const targetIndex = labels.get(target.value);
+              if (targetIndex !== undefined) {
+                for (const reg of livenessTable[targetIndex].liveBefore) {
+                  newLiveness.liveBefore.add(reg);
+                }
+              } else if (/^ret$/i.test(target.value)) {
+                // Jcc RET ... specially handled by ASM
+                // TODO: implement merge
+              }
+            }
+          }
+          break;
+        }
         // case "call":
         //   break;
         // case "int":
@@ -1126,8 +1112,11 @@ function instructionIO(inst: Instruction): [string[], string[]] {
       return [["si"], ["ax"]];
     case "loop":
       return [["cx"], ["cx"]];
-    case "mov":
-      return [[...src(inst)], [...dest(inst), "flags"]]
+    case "mov": {
+      const dest = inst.operands[0] && asRegister(inst.operands[0]);
+      const src = inst.operands[1] && asRegister(inst.operands[1]);
+      return [src ? [src] : [], dest ? [dest] : []]
+    }
     case "xchg":
       if (isSelfOp(inst)) {
         // nop
