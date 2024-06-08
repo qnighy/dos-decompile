@@ -40,7 +40,7 @@ async function main() {
     for (const leadingComment of instruction.leadingComments) {
       cText += `  // ${leadingComment}\n`;
     }
-    // cText += `  // writes: ${inspectWrites(writesFrom[i])}\n`;
+    cText += `  // writes: ${inspectWrites(writesFrom[i])}\n`;
     cText += `  // liveness: ${Array.from(livenessTable[i].liveBefore).join(", ")}\n`;
     cText += `  asm("${escapeC(stringifyInstruction(instruction))}");`;
     if (instruction.trailingComments.length > 0) {
@@ -426,10 +426,13 @@ function analyzeLabels(lines: (Label | Instruction)[]): [Instruction[], Map<stri
 
 type WriteData = {
   writes: Map<string, StackAlias | string | "any">;
-  noReturn: boolean;
+  returnsAt: Set<number>;
 };
-function WriteData(): WriteData {
-  return { writes: new Map(), noReturn: false };
+function emptyWriteData(): WriteData {
+  return { writes: new Map(), returnsAt: new Set() };
+}
+function retWriteData(at: number): WriteData {
+  return { writes: new Map(), returnsAt: new Set([at]) };
 }
 type StackAlias = {
   type: "StackAlias";
@@ -438,35 +441,35 @@ type StackAlias = {
 };
 
 function analyzeWrites(instructions: Instruction[], labels: Map<string, number>): WriteData[] {
-  const writesFrom: WriteData[] = Array.from({ length: instructions.length }, () => WriteData());
+  const writesFrom: WriteData[] = Array.from({ length: instructions.length }, () => emptyWriteData());
   let changed = true;
   while (changed) {
     changed = false;
     for (let i = instructions.length - 1; i >= 0; i--) {
       const instruction = instructions[i];
       const writeData = writesFrom[i];
-      const nextWriteData: WriteData = i + 1 < instructions.length ? writesFrom[i + 1] : WriteData();
+      const nextWriteData: WriteData = i + 1 < instructions.length ? writesFrom[i + 1] : emptyWriteData();
       let newWriteData: WriteData | undefined = undefined;
       switch (instruction.mnemonic) {
         case "mov": {
           const dest = instruction.operands[0] && asRegister(instruction.operands[0]);
           if (dest === "sp") {
-            newWriteData = { ...WriteData(), noReturn: true };
+            newWriteData = emptyWriteData();
           }
           const src = instruction.operands[1] && asRegister(instruction.operands[1]);
           if (dest && src && dest !== "sp") {
-            const thisInstr: WriteData = WriteData();
+            const mapping: SeqWritesMapping = {};
             for (const reg of expandAliases([dest])) {
-              thisInstr.writes.set(reg, "any");
+              mapping[reg] = "any";
             }
-            thisInstr.writes.set(dest, src);
+            mapping[dest] = src;
             for (const [key, destSub] of Object.entries(SUB_REGS.get(dest) ?? {})) {
               const srcSub = SUB_REGS.get(src)?.[key];
               if (srcSub) {
-                thisInstr.writes.set(destSub, srcSub);
+                mapping[destSub] = srcSub;
               }
             }
-            newWriteData = composeWrites(thisInstr, nextWriteData);
+            newWriteData = seqWrites(nextWriteData, mapping);
           }
           break;
         }
@@ -480,7 +483,7 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
         case "pop": {
           const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
           if (reg) {
-            newWriteData = pushWrites(nextWriteData, 2, {
+            newWriteData = seqWrites(pushWrites(nextWriteData, 2), {
               [reg]: {
                 type: "StackAlias",
                 index: 0,
@@ -488,12 +491,12 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
               },
             });
           } else {
-            newWriteData = pushWrites(nextWriteData, 2, {});
+            newWriteData = pushWrites(nextWriteData, 2);
           }
           break;
         }
         case "ret":
-          newWriteData = WriteData();
+          newWriteData = retWriteData(i);
           break;
         case "jp": // Considered an unconditional jump here
         case "jmp":
@@ -538,19 +541,12 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
         case "jnb":
         case "jc":
         case "jnc": {
-          // Check condition flags
-          const thisInstr: WriteData = WriteData();
-          const [, dest] = instructionIO(instruction);
-          for (const reg of expandAliases(dest)) {
-            thisInstr.writes.set(reg, "any");
-          }
-
           if (instruction.operands.length === 1) {
             const target = instruction.operands[0];
             if (target.type === "SimpleOperand") {
               const targetIndex = labels.get(target.value);
               if (targetIndex !== undefined) {
-                newWriteData = composeWrites(thisInstr, mergeWrites(nextWriteData, writesFrom[targetIndex]));
+                newWriteData = mergeWrites(nextWriteData, writesFrom[targetIndex]);
               }
             }
           }
@@ -562,12 +558,12 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
           break;
       }
       if (!newWriteData) {
-        const thisInstr: WriteData = WriteData();
+        const mapping: SeqWritesMapping = {};
         const [, dest] = instructionIO(instruction);
         for (const reg of expandAliases(dest)) {
-          thisInstr.writes.set(reg, "any");
+          mapping[reg] = "any";
         }
-        newWriteData = composeWrites(thisInstr, nextWriteData);
+        newWriteData = seqWrites(nextWriteData, mapping);
       }
       changed = updateWrites(writeData, newWriteData) || changed;
     }
@@ -575,16 +571,16 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
   return writesFrom;
 }
 
-function pushWrites(writeSrc: WriteData, offset: number, mapping: Record<string, StackAlias>): WriteData {
-  if (writeSrc.noReturn) {
-    return { ...WriteData(), noReturn: true };
+function pushWrites(writeSrc: WriteData, offset: number): WriteData {
+  if (writeSrc.returnsAt.size === 0) {
+    return emptyWriteData();
   }
   const newWrites: Map<string, StackAlias | string | "any"> = new Map();
   for (const [key, value] of writeSrc.writes.entries()) {
     if (value === "any") {
       newWrites.set(key, "any");
     } else if (typeof value === "string") {
-      newWrites.set(key, mapping[value] ?? value);
+      newWrites.set(key, value);
     } else if (value.type === "StackAlias") {
       newWrites.set(key, {
         type: "StackAlias",
@@ -593,15 +589,12 @@ function pushWrites(writeSrc: WriteData, offset: number, mapping: Record<string,
       });
     }
   }
-  for (const [key, value] of Object.entries(mapping)) {
-    newWrites.set(key, value);
-  }
-  return { writes: newWrites, noReturn: false };
+  return { writes: newWrites, returnsAt: writeSrc.returnsAt };
 }
 
 function popWrites(writeSrc: WriteData, offset: number, resultReg: string | undefined): WriteData {
-  if (writeSrc.noReturn) {
-    return { ...WriteData(), noReturn: true };
+  if (writeSrc.returnsAt.size === 0) {
+    return emptyWriteData();
   }
   const newWrites: Map<string, StackAlias | string | "any"> = new Map();
   const restoreList: string[] = [];
@@ -640,36 +633,36 @@ function popWrites(writeSrc: WriteData, offset: number, resultReg: string | unde
       newWrites.delete(key);
     }
   }
-  return { writes: newWrites, noReturn: false  };
+  return { writes: newWrites, returnsAt: writeSrc.returnsAt };
 }
 
-function composeWrites(write1: WriteData, write2: WriteData): WriteData {
-  if (write1.noReturn || write2.noReturn) {
-    return { ...WriteData(), noReturn: true };
+type SeqWritesMapping = Record<string, string | StackAlias | "any">;
+function seqWrites(next: WriteData, mapping: Record<string, string | StackAlias | "any">): WriteData {
+  if (next.returnsAt.size === 0) {
+    return emptyWriteData();
   }
   const newWrites: Map<string, StackAlias | string | "any"> = new Map();
-  for (const [key, value2] of write2.writes.entries()) {
-    if (value2 === "any") {
+  for (const [key, value] of next.writes.entries()) {
+    if (value === "any") {
       newWrites.set(key, "any");
-    } else if (typeof value2 === "string") {
-      const value1 = write1.writes.get(value2);
-      newWrites.set(key, value1 ?? value2);
-    } else if (value2.type === "StackAlias") {
-      newWrites.set(key, value2);
+    } else if (typeof value === "string") {
+      newWrites.set(key, mapping[value] ?? value);
+    } else if (value.type === "StackAlias") {
+      newWrites.set(key, value);
     }
   }
-  for (const [key, value1] of write1.writes.entries()) {
-    if (write2.writes.get(key) === undefined) {
-      newWrites.set(key, value1);
+  for (const [key, value] of Object.entries(mapping)) {
+    if (!next.writes.has(key)) {
+      newWrites.set(key, value);
     }
   }
-  return { writes: newWrites, noReturn: false };
+  return { writes: newWrites, returnsAt: next.returnsAt };
 }
 
 function mergeWrites(write1: WriteData, write2: WriteData): WriteData {
-  if (write1.noReturn) {
+  if (write1.returnsAt.size === 0) {
     return write2;
-  } else if (write2.noReturn) {
+  } else if (write2.returnsAt.size === 0) {
     return write1;
   }
   const newWrites: Map<string, StackAlias | string | "any"> = new Map();
@@ -695,7 +688,7 @@ function mergeWrites(write1: WriteData, write2: WriteData): WriteData {
       newWrites.set(key, "any");
     }
   }
-  return { writes: newWrites, noReturn: false };
+  return { writes: newWrites, returnsAt: write1.returnsAt.union(write2.returnsAt) };
 }
 
 function updateWrites(writeDataDest: WriteData, writeDataSrc: WriteData): boolean {
@@ -718,11 +711,17 @@ function updateWrites(writeDataDest: WriteData, writeDataSrc: WriteData): boolea
       changed = true;
     }
   }
+  for (const key of writeDataSrc.returnsAt) {
+    if (!writeDataDest.returnsAt.has(key)) {
+      writeDataDest.returnsAt.add(key);
+      changed = true;
+    }
+  }
   return changed;
 }
 
 function inspectWrites(writeData: WriteData): string {
-  if (writeData.noReturn) {
+  if (writeData.returnsAt.size === 0) {
     return "no return";
   }
   const regs: string[] = Array.from(writeData.writes.keys());
