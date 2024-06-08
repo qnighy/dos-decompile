@@ -5,6 +5,7 @@ async function main() {
   const [lines, consts] = extractConstants(origLines);
   const [instructions, labels, inverseLabels] = analyzeLabels(lines);
   const writesFrom = analyzeWrites(instructions, labels);
+  const functionEntries = markFunctions(instructions, labels, inverseLabels, writesFrom);
   const { instructionLiveness: livenessTable, functionReturns } = analyzeLiveness(instructions, labels, writesFrom);
 
   let cText = "";
@@ -23,6 +24,9 @@ async function main() {
   }
   cText += "int main() {\n";
   for (let i = 0; i < instructions.length; i++) {
+    if (functionEntries.has(i)) {
+      cText += `// function\n`;
+    }
     if (functionReturns.has(i)) {
       cText += `// returns: ${Array.from(functionReturns.get(i)!).join(", ")}\n`;
     }
@@ -746,6 +750,134 @@ function inspectWrites(writeData: WriteData): string {
     return "";
   });
   return regEntries.join(", ") + ", sp=" + writeData.sp;
+}
+
+function markFunctions(instructions: Instruction[], labels: Map<string, number>, inverseLabels: Map<number, Label[]>, writesFrom: WriteData[]): Set<number> {
+  const labelGraph: Map<number, number[]> = new Map();
+  let lastLabel: number | undefined = undefined;
+  for (let i = 0; i < instructions.length; i++) {
+    if (inverseLabels.has(i) && inverseLabels.get(i)!.length > 0) {
+      if (lastLabel != null) {
+        labelGraph.get(lastLabel)!.push(i);
+      }
+      lastLabel = i;
+      labelGraph.set(i, []);
+    }
+    const instruction = instructions[i];
+    switch (instruction.mnemonic) {
+      case "ret":
+        lastLabel = undefined;
+        break;
+      case "jp": // Considered an unconditional jump here
+      case "jmp":
+      case "jmps":
+        if (instruction.operands.length === 1) {
+          const target = instruction.operands[0];
+          if (target.type === "SimpleOperand") {
+            const targetIndex = labels.get(target.value);
+            if (targetIndex !== undefined) {
+              if (lastLabel !== undefined) {
+                labelGraph.get(lastLabel)!.push(targetIndex);
+              }
+            }
+          }
+        }
+        lastLabel = undefined;
+        break;
+      case "ja":
+      case "jna":
+      case "jbe":
+      case "jnbe":
+      case "jg":
+      case "jng":
+      case "jle":
+      case "jnle":
+      case "jge":
+      case "jnge":
+      case "jl":
+      case "jnl":
+      case "jo":
+      case "jno":
+      case "js":
+      case "jns":
+      case "je":
+      case "jne":
+      case "jz":
+      case "jnz":
+      // case "jp":
+      case "jnp":
+      case "jpe":
+      case "jpo":
+      case "jae":
+      case "jnae":
+      case "jb":
+      case "jnb":
+      case "jc":
+      case "jnc": {
+        if (instruction.operands.length === 1) {
+          const target = instruction.operands[0];
+          if (target.type === "SimpleOperand") {
+            const targetIndex = labels.get(target.value);
+            if (targetIndex !== undefined) {
+              if (lastLabel !== undefined) {
+                labelGraph.get(lastLabel)!.push(targetIndex);
+              }
+            }
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  const functionEntries: Set<number> = new Set();
+  for (let i = 0; i < instructions.length; i++) {
+    const instruction = instructions[i];
+    if (instruction.mnemonic === "call" && instruction.operands.length === 1) {
+      const target = instruction.operands[0];
+      if (target.type === "SimpleOperand") {
+        const targetIndex = labels.get(target.value);
+        if (targetIndex !== undefined) {
+          functionEntries.add(targetIndex);
+        }
+      }
+    }
+  }
+  let changed = true;
+  while (changed) {
+    changed = false;
+
+    const visited: Set<number> = new Set();
+    const owned: Set<number> = new Set();
+    for (const functionEntry of Array.from(functionEntries)) {
+      visited.clear();
+      search(functionEntry, functionEntry);
+    }
+    // deno-lint-ignore no-inner-declarations
+    function search(v: number, owner: number) {
+      if (v !== owner && functionEntries.has(v)) {
+        return;
+      }
+      if (visited.has(v)) {
+        return;
+      }
+      visited.add(v);
+      const sp = writesFrom[v].sp;
+      const entryEligible = sp === "any" || sp === 0;
+      if (entryEligible) {
+        if (owned.has(v) && !functionEntries.has(v)) {
+          functionEntries.add(v);
+          changed = true;
+          return;
+        }
+        owned.add(v);
+      }
+      for (const u of labelGraph.get(v) ?? []) {
+        search(u, owner);
+      }
+    }
+  }
+  return functionEntries;
 }
 
 type LivenessResult = {
