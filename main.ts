@@ -413,7 +413,7 @@ function analyzeLabels(lines: (Label | Instruction)[]): [Instruction[], Map<stri
       for (const label of pendingLabels) {
         labels.set(label.name, instructions.length);
       }
-      inverseLabels.set(instructions.length, pendingLabels);
+      inverseLabels.set(instructions.length, [...pendingLabels]);
       pendingLabels.length = 0;
       instructions.push(line);
     }
@@ -428,6 +428,7 @@ type WriteData = {
 type StackAlias = {
   type: "StackAlias";
   index: number;
+  size: number;
 };
 
 function analyzeWrites(instructions: Instruction[]): WriteData[] {
@@ -444,11 +445,28 @@ function analyzeWrites(instructions: Instruction[]): WriteData[] {
         case "mov":
         case "xchg":
           break;
-        case "push":
+        case "push": {
+          const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+          newWriteData = popWrites(nextWriteData, 2, reg);
           break;
-        case "pop":
+        }
+        case "pop": {
+          const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+          if (reg) {
+            newWriteData = pushWrites(nextWriteData, 2, {
+              [reg]: {
+                type: "StackAlias",
+                index: 0,
+                size: 2,
+              },
+            });
+          } else {
+            newWriteData = pushWrites(nextWriteData, 2, {});
+          }
           break;
+        }
         case "ret":
+          newWriteData = { writes: new Map() };
           break;
         case "jp": // Considered an unconditional jump here
         case "jmp":
@@ -495,7 +513,7 @@ function analyzeWrites(instructions: Instruction[]): WriteData[] {
           writes: new Map(),
         };
         const [, dest] = instructionIO(instruction);
-        for (const reg of dest) {
+        for (const reg of expandAliases(dest)) {
           thisInstr.writes.set(reg, "any");
         }
         newWriteData = composeWrites(thisInstr, nextWriteData);
@@ -504,6 +522,88 @@ function analyzeWrites(instructions: Instruction[]): WriteData[] {
     }
   }
   return writesFrom;
+}
+
+function pushWrites(writeSrc: WriteData, offset: number, mapping: Record<string, StackAlias>): WriteData {
+  const newWrites: Map<string, StackAlias | string | "any"> = new Map();
+  for (const [key, value] of writeSrc.writes.entries()) {
+    if (value === "any") {
+      newWrites.set(key, "any");
+    } else if (typeof value === "string") {
+      newWrites.set(key, mapping[value] ?? value);
+    } else if (value.type === "StackAlias") {
+      newWrites.set(key, {
+        type: "StackAlias",
+        index: value.index + offset,
+        size: value.size,
+      });
+    }
+  }
+  for (const [key, value] of Object.entries(mapping)) {
+    if (!newWrites.has(key)) {
+      newWrites.set(key, value);
+    }
+  }
+  return { writes: newWrites };
+}
+
+function popWrites(writeSrc: WriteData, offset: number, resultReg: string | undefined): WriteData {
+  const newWrites: Map<string, StackAlias | string | "any"> = new Map();
+  const restoreList: string[] = [];
+  for (const [key, value] of writeSrc.writes.entries()) {
+    if (value === "any") {
+      newWrites.set(key, "any");
+    } else if (typeof value === "string") {
+      newWrites.set(key, value);
+    } else if (value.type === "StackAlias") {
+      if (value.index === 0 && value.size === 2 && resultReg) {
+        restoreList.push(key);
+      } else if (value.index < offset) {
+        newWrites.set(key, "any");
+      } else {
+        newWrites.set(key, {
+          type: "StackAlias",
+          index: value.index - offset,
+          size: value.size,
+        });
+      }
+    }
+  }
+  for (const restoreReg of restoreList) {
+    newWrites.set(restoreReg, resultReg!);
+    const restoreMap = SUB_REGS.get(restoreReg) ?? {};
+    const resultMap = SUB_REGS.get(resultReg!) ?? {};
+    for (const [key, subRestoreReg] of Object.entries(restoreMap)) {
+      const subResultReg = resultMap[key];
+      if (subResultReg) {
+        newWrites.set(subRestoreReg, subResultReg);
+      }
+    }
+  }
+  for (const [key, value] of Array.from(newWrites.entries())) {
+    if (key === value) {
+      newWrites.delete(key);
+    }
+  }
+  return { writes: newWrites };
+}
+
+function shiftWrites(writeSrc: WriteData, offset: number): WriteData {
+  const newWrites: Map<string, StackAlias | string | "any"> = new Map();
+  for (const [key, value] of writeSrc.writes.entries()) {
+    if (value === "any") {
+      newWrites.set(key, "any");
+    } else if (typeof value === "string") {
+      newWrites.set(key, value);
+    } else if (value.type === "StackAlias") {
+      newWrites.set(key, {
+        type: "StackAlias",
+        index: value.index + offset,
+        size: value.size,
+      });
+    }
+  }
+  return { writes: newWrites };
 }
 
 function composeWrites(write1: WriteData, write2: WriteData): WriteData {
@@ -567,27 +667,44 @@ const REG_NAMES: Set<string> = new Set([
   "si",
   "di",
 ]);
-const DEP_EXPAND: Map<string, string[]> = new Map([
-  ["ax", ["ah", "al"]],
-  ["cx", ["ch", "cl"]],
-  ["dx", ["dh", "dl"]],
-  ["bx", ["bh", "bl"]],
-  ["flags", ["of", "sf", "zf", "af", "pf", "cf"]],
+const SUB_REGS: Map<string, Record<string, string>> = new Map<string, Record<string, string>>([
+  ["ax", { highByte: "ah", byte: "al" }],
+  ["cx", { highByte: "ch", byte: "cl" }],
+  ["dx", { highByte: "dh", byte: "dl" }],
+  ["bx", { highByte: "bh", byte: "bl" }],
+  ["hflags", { bit7: "sf", bit6: "zf", bit4: "af", bit2: "pf", bit0: "cf" }],
+  ["flags", { bit11: "of", bit10: "df", bit9: "if", bit8: "tf", bit7: "sf", bit6: "zf", bit4: "af", bit2: "pf", bit0: "cf" }],
 ]);
+const SUPER_REGS: Map<string, string[]> = new Map();
+for (const [key, value] of SUB_REGS) {
+  for (const sub of Object.values(value)) {
+    if (SUPER_REGS.has(sub)) {
+      SUPER_REGS.get(sub)!.push(key);
+    } else {
+      SUPER_REGS.set(sub, [key]);
+    }
+  }
+}
+
+function expandAliases(reg: string[]): string[] {
+  const subClosedRegs: Set<string> = new Set();
+  for (const r of reg) {
+    subClosedRegs.add(r);
+    for (const sub of Object.values(SUB_REGS.get(r) ?? {})) {
+      subClosedRegs.add(sub);
+    }
+  }
+  const result: Set<string> = new Set();
+  for (const r of subClosedRegs) {
+    result.add(r);
+    for (const sup of SUPER_REGS.get(r) ?? []) {
+      result.add(sup);
+    }
+  }
+  return Array.from(result);
+}
 
 function instructionIO(inst: Instruction): [string[], string[]] {
-  const [srcOrig, destOrig] = instructionIOImpl(inst);
-  const src: string[] = [];
-  for (const s of srcOrig) {
-    src.push(...DEP_EXPAND.get(s) || [s]);
-  }
-  const dest: string[] = [];
-  for (const d of destOrig) {
-    dest.push(...DEP_EXPAND.get(d) || [d]);
-  }
-  return [src, dest];
-}
-function instructionIOImpl(inst: Instruction): [string[], string[]] {
   function dest(inst: Instruction): string[] {
     if (inst.operands.length === 0) {
       return [];
