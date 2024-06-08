@@ -462,7 +462,7 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
           const src = instruction.operands[1] && asRegister(instruction.operands[1]);
           if (dest && src && dest !== "sp") {
             const mapping: SeqWritesMapping = {};
-            for (const reg of expandAliases([dest])) {
+            for (const reg of expandAliases(new Set([dest]))) {
               mapping[reg] = "any";
             }
             mapping[dest] = src;
@@ -865,9 +865,9 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
                 if (instruction.mnemonic === "call") {
                   const functionWrites = new Set(writesFrom[targetIndex].writes.keys());
                   const preservedRegs = livenessNext.liveBefore.difference(functionWrites);
-                  newLiveness = { liveBefore: new Set(livenessTable[targetIndex].liveBefore).union(preservedRegs) };
+                  newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore.union(preservedRegs) };
                 } else {
-                  newLiveness = { liveBefore: new Set(livenessTable[targetIndex].liveBefore) };
+                  newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore };
                 }
               }
             }
@@ -942,7 +942,7 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
         //   break;
       }
       if (!newLiveness) {
-        newLiveness = { liveBefore: new Set(decomposeCoverings(Array.from(livenessNext.liveBefore))) };
+        newLiveness = { liveBefore: decomposeCoverings(livenessNext.liveBefore) };
         const [src, dest] = instructionIO(instruction);
         for (const reg of expandCoverings(dest)) {
           newLiveness.liveBefore.delete(reg);
@@ -1008,7 +1008,7 @@ const REG_COVERINGS: [string, string[]][] = [
   ["bx", ["bh", "bl"]],
 ];
 
-function expandSubRegs(regs: string[]): string[] {
+function expandSubRegs(regs: Set<string>): Set<string> {
   const result: Set<string> = new Set();
   for (const r of regs) {
     result.add(r);
@@ -1016,20 +1016,20 @@ function expandSubRegs(regs: string[]): string[] {
       result.add(sub);
     }
   }
-  return Array.from(result);
+  return result;
 }
 
-function expandCoverings(regs: string[]): string[] {
-  const subClosedRegs = new Set(expandSubRegs(regs));
+function expandCoverings(regs: Set<string>): Set<string> {
+  const subClosedRegs = expandSubRegs(regs);
   for (const [superReg, subRegs] of REG_COVERINGS) {
     if (subRegs.every((sub) => subClosedRegs.has(sub))) {
       subClosedRegs.add(superReg);
     }
   }
-  return Array.from(subClosedRegs);
+  return subClosedRegs;
 }
 
-function decomposeCoverings(regs: string[]): string[] {
+function decomposeCoverings(regs: Set<string>): Set<string> {
   const result: Set<string> = new Set(regs);
   for (const [superReg, subRegs] of REG_COVERINGS) {
     if (result.has(superReg)) {
@@ -1039,10 +1039,10 @@ function decomposeCoverings(regs: string[]): string[] {
       }
     }
   }
-  return Array.from(result);
+  return result;
 }
 
-function expandAliases(reg: string[]): string[] {
+function expandAliases(reg: Set<string>): Set<string> {
   const subClosedRegs: Set<string> = new Set();
   for (const r of reg) {
     subClosedRegs.add(r);
@@ -1057,10 +1057,14 @@ function expandAliases(reg: string[]): string[] {
       result.add(sup);
     }
   }
-  return Array.from(result);
+  return result;
 }
 
-function instructionIO(inst: Instruction): [string[], string[]] {
+function instructionIO(inst: Instruction): [Set<string>, Set<string>] {
+  const [dest, src] = instructionIOImpl(inst);
+  return [new Set(dest), new Set(src)];
+}
+function instructionIOImpl(inst: Instruction): [string[], string[]] {
   function dest(inst: Instruction): string[] {
     if (inst.operands.length === 0) {
       return [];
