@@ -448,8 +448,23 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
       switch (instruction.mnemonic) {
         case "mov": {
           const dest = instruction.operands[0] && asRegister(instruction.operands[0]);
-          if (dest == "sp") {
+          if (dest === "sp") {
             newWriteData = { ...WriteData(), noReturn: true };
+          }
+          const src = instruction.operands[1] && asRegister(instruction.operands[1]);
+          if (dest && src && dest !== "sp") {
+            const thisInstr: WriteData = WriteData();
+            for (const reg of expandAliases([dest])) {
+              thisInstr.writes.set(reg, "any");
+            }
+            thisInstr.writes.set(dest, src);
+            for (const [key, destSub] of Object.entries(SUB_REGS.get(dest) ?? {})) {
+              const srcSub = SUB_REGS.get(src)?.[key];
+              if (srcSub) {
+                thisInstr.writes.set(destSub, srcSub);
+              }
+            }
+            newWriteData = composeWrites(thisInstr, nextWriteData);
           }
           break;
         }
@@ -1001,7 +1016,7 @@ function instructionIO(inst: Instruction): [string[], string[]] {
     case "put":
       return [[], []];
     default:
-      console.log("analyzeWrites: Unknown mnemonic", inst.mnemonic);
+      console.log("instructionIO: Unknown mnemonic", inst.mnemonic);
       return [[], []];
   }
 }
