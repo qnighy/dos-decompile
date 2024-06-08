@@ -4,7 +4,7 @@ async function main() {
   const origLines = parseLines(tokens);
   const [lines, consts] = extractConstants(origLines);
   const [instructions, labels, inverseLabels] = analyzeLabels(lines);
-  const writesFrom = analyzeWrites(instructions);
+  const writesFrom = analyzeWrites(instructions, labels);
 
   let cText = "";
   for (const constDecl of consts.values()) {
@@ -39,7 +39,7 @@ async function main() {
     for (const leadingComment of instruction.leadingComments) {
       cText += `  // ${leadingComment}\n`;
     }
-    cText += `  // writes: ${Deno.inspect(writesFrom[i].writes).replace(/\n/g, "\n  //         ")}\n`;
+    cText += `  // writes: ${inspectWrites(writesFrom[i])}\n`;
     cText += `  asm("${escapeC(stringifyInstruction(instruction))}");`;
     if (instruction.trailingComments.length > 0) {
       cText += " //";
@@ -431,7 +431,7 @@ type StackAlias = {
   size: number;
 };
 
-function analyzeWrites(instructions: Instruction[]): WriteData[] {
+function analyzeWrites(instructions: Instruction[], labels: Map<string, number>): WriteData[] {
   const writesFrom: WriteData[] = Array.from({ length: instructions.length }, () => ({ writes: new Map() }));
   let changed = true;
   while (changed) {
@@ -471,6 +471,15 @@ function analyzeWrites(instructions: Instruction[]): WriteData[] {
         case "jp": // Considered an unconditional jump here
         case "jmp":
         case "jmps":
+          if (instruction.operands.length === 1) {
+            const target = instruction.operands[0];
+            if (target.type === "SimpleOperand") {
+              const targetIndex = labels.get(target.value);
+              if (targetIndex !== undefined) {
+                newWriteData = writesFrom[targetIndex];
+              }
+            }
+          }
           break;
         case "ja":
         case "jna":
@@ -501,8 +510,27 @@ function analyzeWrites(instructions: Instruction[]): WriteData[] {
         case "jb":
         case "jnb":
         case "jc":
-        case "jnc":
+        case "jnc": {
+          // Check condition flags
+          const thisInstr: WriteData = {
+            writes: new Map(),
+          };
+          const [, dest] = instructionIO(instruction);
+          for (const reg of expandAliases(dest)) {
+            thisInstr.writes.set(reg, "any");
+          }
+
+          if (instruction.operands.length === 1) {
+            const target = instruction.operands[0];
+            if (target.type === "SimpleOperand") {
+              const targetIndex = labels.get(target.value);
+              if (targetIndex !== undefined) {
+                newWriteData = composeWrites(thisInstr, mergeWrites(nextWriteData, writesFrom[targetIndex]));
+              }
+            }
+          }
           break;
+        }
         case "call":
           break;
         case "int":
@@ -588,24 +616,6 @@ function popWrites(writeSrc: WriteData, offset: number, resultReg: string | unde
   return { writes: newWrites };
 }
 
-function shiftWrites(writeSrc: WriteData, offset: number): WriteData {
-  const newWrites: Map<string, StackAlias | string | "any"> = new Map();
-  for (const [key, value] of writeSrc.writes.entries()) {
-    if (value === "any") {
-      newWrites.set(key, "any");
-    } else if (typeof value === "string") {
-      newWrites.set(key, value);
-    } else if (value.type === "StackAlias") {
-      newWrites.set(key, {
-        type: "StackAlias",
-        index: value.index + offset,
-        size: value.size,
-      });
-    }
-  }
-  return { writes: newWrites };
-}
-
 function composeWrites(write1: WriteData, write2: WriteData): WriteData {
   const newWrites: Map<string, StackAlias | string | "any"> = new Map();
   for (const [key, value2] of write2.writes.entries()) {
@@ -621,6 +631,33 @@ function composeWrites(write1: WriteData, write2: WriteData): WriteData {
   for (const [key, value1] of write1.writes.entries()) {
     if (write2.writes.get(key) === undefined) {
       newWrites.set(key, value1);
+    }
+  }
+  return { writes: newWrites };
+}
+
+function mergeWrites(write1: WriteData, write2: WriteData): WriteData {
+  const newWrites: Map<string, StackAlias | string | "any"> = new Map();
+  for (const [key, value1] of write1.writes.entries()) {
+    newWrites.set(key, value1);
+  }
+  for (const [key, value2] of write2.writes.entries()) {
+    const value1 = newWrites.get(key);
+    if (value1 === undefined) {
+      newWrites.set(key, value2);
+    } else if (typeof value1 === "string" && typeof value2 === "string" && value1 === value2) {
+      // do nothing
+    } else if (
+      typeof value1 === "object" &&
+      value1.type === "StackAlias" &&
+      typeof value2 === "object" &&
+      value2.type === "StackAlias" &&
+      value1.index === value2.index &&
+      value1.size === value2.size
+    ) {
+      // do nothing
+    } else {
+      newWrites.set(key, "any");
     }
   }
   return { writes: newWrites };
@@ -647,6 +684,23 @@ function updateWrites(writeDataDest: WriteData, writeDataSrc: WriteData): boolea
     }
   }
   return changed;
+}
+
+function inspectWrites(writeData: WriteData): string {
+  const regs: string[] = Array.from(writeData.writes.keys());
+  regs.sort();
+  const regEntries: string[] = regs.map((reg) => {
+    const value = writeData.writes.get(reg)!;
+    if (value === "any") {
+      return `${reg}`;
+    } else if (typeof value === "string") {
+      return `${reg}=${value}`;
+    } else if (value.type === "StackAlias") {
+      return `${reg}=[sp+${value.index}]`;
+    }
+    return "";
+  });
+  return regEntries.join(", ");
 }
 
 const REG_NAMES: Set<string> = new Set([
