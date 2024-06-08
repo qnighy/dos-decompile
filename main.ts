@@ -841,7 +841,13 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
             if (target.type === "SimpleOperand") {
               const targetIndex = labels.get(target.value);
               if (targetIndex !== undefined) {
-                newLiveness = { liveBefore: new Set(livenessTable[targetIndex].liveBefore) };
+                if (instruction.mnemonic === "call") {
+                  const functionWrites = new Set(writesFrom[targetIndex].writes.keys());
+                  const preservedRegs = livenessNext.liveBefore.difference(functionWrites);
+                  newLiveness = { liveBefore: new Set(livenessTable[targetIndex].liveBefore).union(preservedRegs) };
+                } else {
+                  newLiveness = { liveBefore: new Set(livenessTable[targetIndex].liveBefore) };
+                }
               }
             }
           }
@@ -878,8 +884,8 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
         case "jnc": {
           newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
           // Check condition flags
-          const [, dest] = instructionIO(instruction);
-          for (const reg of expandCoverings(dest)) {
+          const [src] = instructionIO(instruction);
+          for (const reg of src) {
             newLiveness.liveBefore.add(reg);
           }
 
