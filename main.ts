@@ -5,7 +5,7 @@ async function main() {
   const [lines, consts] = extractConstants(origLines);
   const [instructions, labels, inverseLabels] = analyzeLabels(lines);
   const writesFrom = analyzeWrites(instructions, labels);
-  const livenessTable = analyzeLiveness(instructions, labels);
+  const livenessTable = analyzeLiveness(instructions, labels, writesFrom);
 
   let cText = "";
   for (const constDecl of consts.values()) {
@@ -744,7 +744,44 @@ type Liveness = {
   liveBefore: Set<string>;
 };
 
-function analyzeLiveness(instructions: Instruction[], labels: Map<string, number>): Liveness[] {
+function analyzeLiveness(instructions: Instruction[], labels: Map<string, number>, writesFrom: WriteData[]): Liveness[] {
+  const returnOriginMap: Map<number, number[]> = new Map();
+  const callOriginMap: Map<number, number[]> = new Map();
+  {
+    const processedCalls: Set<number> = new Set();
+    // deno-lint-ignore no-inner-declarations
+    function processCall(i: number) {
+      if (processedCalls.has(i)) {
+        return;
+      }
+      processedCalls.add(i);
+      const returns = writesFrom[i].returnsAt;
+      for (const ret of returns) {
+        if (returnOriginMap.has(ret)) {
+          returnOriginMap.get(ret)!.push(i);
+        } else {
+          returnOriginMap.set(ret, [i]);
+        }
+      }
+    }
+    for (let i = 0; i < instructions.length; i++) {
+      const instruction = instructions[i];
+      if (instruction.mnemonic === "call" && instruction.operands.length === 1) {
+        const target = instruction.operands[0];
+        if (target.type === "SimpleOperand") {
+          const targetIndex = labels.get(target.value);
+          if (targetIndex !== undefined) {
+            processCall(targetIndex);
+            if (callOriginMap.has(targetIndex)) {
+              callOriginMap.get(targetIndex)!.push(i);
+            } else {
+              callOriginMap.set(targetIndex, [i]);
+            }
+          }
+        }
+      }
+    }
+  }
   const livenessTable: Liveness[] = Array.from({ length: instructions.length }, () => ({ liveBefore: new Set() }));
   let changed = true;
   while (changed) {
@@ -782,10 +819,23 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
         // }
         case "ret":
           newLiveness = { liveBefore: new Set() };
+          for (const functionEntry of returnOriginMap.get(i) ?? []) {
+            const functionWrites = new Set(writesFrom[functionEntry].writes.keys());
+            for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
+              if (callIndex + 1 >= instructions.length) {
+                continue;
+              }
+              const innerLiveness = livenessTable[callIndex + 1].liveBefore.intersection(functionWrites);
+              for (const reg of innerLiveness) {
+                newLiveness.liveBefore.add(reg);
+              }
+            }
+          }
           break;
         case "jp": // Considered an unconditional jump here
         case "jmp":
         case "jmps":
+        case "call":
           if (instruction.operands.length === 1) {
             const target = instruction.operands[0];
             if (target.type === "SimpleOperand") {
@@ -843,14 +893,24 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
                 }
               } else if (/^ret$/i.test(target.value)) {
                 // Jcc RET ... specially handled by ASM
-                // TODO: implement merge
+                // TODO: integrate logic with RET
+                for (const functionEntry of returnOriginMap.get(i) ?? []) {
+                  const functionWrites = new Set(writesFrom[functionEntry].writes.keys());
+                  for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
+                    if (callIndex + 1 >= instructions.length) {
+                      continue;
+                    }
+                    const innerLiveness = livenessTable[callIndex + 1].liveBefore.intersection(functionWrites);
+                    for (const reg of innerLiveness) {
+                      newLiveness.liveBefore.add(reg);
+                    }
+                  }
+                }
               }
             }
           }
           break;
         }
-        // case "call":
-        //   break;
         // case "int":
         //   break;
       }
