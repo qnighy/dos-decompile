@@ -5,6 +5,7 @@ async function main() {
   const [lines, consts] = extractConstants(origLines);
   const [instructions, labels, inverseLabels] = analyzeLabels(lines);
   const writesFrom = analyzeWrites(instructions, labels);
+  const livenessTable = analyzeLiveness(instructions, labels);
 
   let cText = "";
   for (const constDecl of consts.values()) {
@@ -40,6 +41,7 @@ async function main() {
       cText += `  // ${leadingComment}\n`;
     }
     cText += `  // writes: ${inspectWrites(writesFrom[i])}\n`;
+    cText += `  // liveness: ${Array.from(livenessTable[i].liveBefore).join(", ")}\n`;
     cText += `  asm("${escapeC(stringifyInstruction(instruction))}");`;
     if (instruction.trailingComments.length > 0) {
       cText += " //";
@@ -739,6 +741,155 @@ function inspectWrites(writeData: WriteData): string {
   return regEntries.join(", ");
 }
 
+type Liveness = {
+  liveBefore: Set<string>;
+};
+
+function analyzeLiveness(instructions: Instruction[], labels: Map<string, number>): Liveness[] {
+  const livenessTable: Liveness[] = Array.from({ length: instructions.length }, () => ({ liveBefore: new Set() }));
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = instructions.length - 1; i >= 0; i--) {
+      const instruction = instructions[i];
+      const livenessHere = livenessTable[i];
+      const livenessNext: Liveness = i + 1 < instructions.length ? livenessTable[i + 1] : { liveBefore: new Set() };
+      let newLiveness: Liveness | undefined = undefined;
+      switch (instruction.mnemonic) {
+        // case "mov": {
+        //   const dest = instruction.operands[0] && asRegister(instruction.operands[0]);
+        //   if (dest === "sp") {
+        //     newWriteData = { ...WriteData(), noReturn: true };
+        //   }
+        //   const src = instruction.operands[1] && asRegister(instruction.operands[1]);
+        //   if (dest && src && dest !== "sp") {
+        //     const thisInstr: WriteData = WriteData();
+        //     for (const reg of expandAliases([dest])) {
+        //       thisInstr.writes.set(reg, "any");
+        //     }
+        //     thisInstr.writes.set(dest, src);
+        //     for (const [key, destSub] of Object.entries(SUB_REGS.get(dest) ?? {})) {
+        //       const srcSub = SUB_REGS.get(src)?.[key];
+        //       if (srcSub) {
+        //         thisInstr.writes.set(destSub, srcSub);
+        //       }
+        //     }
+        //     newWriteData = composeWrites(thisInstr, nextWriteData);
+        //   }
+        //   break;
+        // }
+        // case "xchg":
+        //   break;
+        // case "push": {
+        //   const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+        //   newWriteData = popWrites(nextWriteData, 2, reg);
+        //   break;
+        // }
+        // case "pop": {
+        //   const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+        //   if (reg) {
+        //     newWriteData = pushWrites(nextWriteData, 2, {
+        //       [reg]: {
+        //         type: "StackAlias",
+        //         index: 0,
+        //         size: 2,
+        //       },
+        //     });
+        //   } else {
+        //     newWriteData = pushWrites(nextWriteData, 2, {});
+        //   }
+        //   break;
+        // }
+        case "ret":
+          newLiveness = { liveBefore: new Set() };
+          break;
+        // case "jp": // Considered an unconditional jump here
+        // case "jmp":
+        // case "jmps":
+        //   if (instruction.operands.length === 1) {
+        //     const target = instruction.operands[0];
+        //     if (target.type === "SimpleOperand") {
+        //       const targetIndex = labels.get(target.value);
+        //       if (targetIndex !== undefined) {
+        //         newWriteData = writesFrom[targetIndex];
+        //       }
+        //     }
+        //   }
+        //   break;
+        // case "ja":
+        // case "jna":
+        // case "jbe":
+        // case "jnbe":
+        // case "jg":
+        // case "jng":
+        // case "jle":
+        // case "jnle":
+        // case "jge":
+        // case "jnge":
+        // case "jl":
+        // case "jnl":
+        // case "jo":
+        // case "jno":
+        // case "js":
+        // case "jns":
+        // case "je":
+        // case "jne":
+        // case "jz":
+        // case "jnz":
+        // // case "jp":
+        // case "jnp":
+        // case "jpe":
+        // case "jpo":
+        // case "jae":
+        // case "jnae":
+        // case "jb":
+        // case "jnb":
+        // case "jc":
+        // case "jnc": {
+        //   // Check condition flags
+        //   const thisInstr: WriteData = WriteData();
+        //   const [, dest] = instructionIO(instruction);
+        //   for (const reg of expandAliases(dest)) {
+        //     thisInstr.writes.set(reg, "any");
+        //   }
+
+        //   if (instruction.operands.length === 1) {
+        //     const target = instruction.operands[0];
+        //     if (target.type === "SimpleOperand") {
+        //       const targetIndex = labels.get(target.value);
+        //       if (targetIndex !== undefined) {
+        //         newWriteData = composeWrites(thisInstr, mergeWrites(nextWriteData, writesFrom[targetIndex]));
+        //       }
+        //     }
+        //   }
+        //   break;
+        // }
+        // case "call":
+        //   break;
+        // case "int":
+        //   break;
+      }
+      if (!newLiveness) {
+        newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
+        const [src, dest] = instructionIO(instruction);
+        for (const reg of expandCoverings(dest)) {
+          newLiveness.liveBefore.delete(reg);
+        }
+        for (const reg of src) {
+          newLiveness.liveBefore.add(reg);
+        }
+      }
+      for (const reg of newLiveness.liveBefore) {
+        if (!livenessHere.liveBefore.has(reg)) {
+          livenessHere.liveBefore.add(reg);
+          changed = true;
+        }
+      }
+    }
+  }
+  return livenessTable;
+}
+
 const REG_NAMES: Set<string> = new Set([
   "al",
   "cl",
@@ -774,6 +925,33 @@ for (const [key, value] of SUB_REGS) {
       SUPER_REGS.set(sub, [key]);
     }
   }
+}
+const REG_COVERINGS: [string, string[]][] = [
+  ["ax", ["ah", "al"]],
+  ["cx", ["ch", "cl"]],
+  ["dx", ["dh", "dl"]],
+  ["bx", ["bh", "bl"]],
+];
+
+function expandSubRegs(regs: string[]): string[] {
+  const result: Set<string> = new Set();
+  for (const r of regs) {
+    result.add(r);
+    for (const sub of Object.values(SUB_REGS.get(r) ?? {})) {
+      result.add(sub);
+    }
+  }
+  return Array.from(result);
+}
+
+function expandCoverings(regs: string[]): string[] {
+  const subClosedRegs = new Set(expandSubRegs(regs));
+  for (const [superReg, subRegs] of REG_COVERINGS) {
+    if (subRegs.every((sub) => subClosedRegs.has(sub))) {
+      subClosedRegs.add(superReg);
+    }
+  }
+  return Array.from(subClosedRegs);
 }
 
 function expandAliases(reg: string[]): string[] {
