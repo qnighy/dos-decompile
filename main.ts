@@ -430,12 +430,13 @@ function analyzeLabels(lines: (Label | Instruction)[]): [Instruction[], Map<stri
 type WriteData = {
   writes: Map<string, StackAlias | string | "any">;
   returnsAt: Set<number>;
+  sp: number | "any";
 };
 function emptyWriteData(): WriteData {
-  return { writes: new Map(), returnsAt: new Set() };
+  return { writes: new Map(), returnsAt: new Set(), sp: 0 };
 }
 function retWriteData(at: number): WriteData {
-  return { writes: new Map(), returnsAt: new Set([at]) };
+  return { writes: new Map(), returnsAt: new Set([at]), sp: 0 };
 }
 type StackAlias = {
   type: "StackAlias";
@@ -592,7 +593,8 @@ function pushWrites(writeSrc: WriteData, offset: number): WriteData {
       });
     }
   }
-  return { writes: newWrites, returnsAt: writeSrc.returnsAt };
+  const sp = writeSrc.sp === "any" ? "any" : writeSrc.sp + offset;
+  return { writes: newWrites, returnsAt: writeSrc.returnsAt, sp };
 }
 
 function popWrites(writeSrc: WriteData, offset: number, resultReg: string | undefined): WriteData {
@@ -636,7 +638,8 @@ function popWrites(writeSrc: WriteData, offset: number, resultReg: string | unde
       newWrites.delete(key);
     }
   }
-  return { writes: newWrites, returnsAt: writeSrc.returnsAt };
+  const sp = writeSrc.sp === "any" ? "any" : writeSrc.sp - offset;
+  return { writes: newWrites, returnsAt: writeSrc.returnsAt, sp };
 }
 
 type SeqWritesMapping = Record<string, string | StackAlias | "any">;
@@ -659,7 +662,7 @@ function seqWrites(next: WriteData, mapping: Record<string, string | StackAlias 
       newWrites.set(key, value);
     }
   }
-  return { writes: newWrites, returnsAt: next.returnsAt };
+  return { writes: newWrites, returnsAt: next.returnsAt, sp: next.sp };
 }
 
 function mergeWrites(write1: WriteData, write2: WriteData): WriteData {
@@ -691,7 +694,8 @@ function mergeWrites(write1: WriteData, write2: WriteData): WriteData {
       newWrites.set(key, "any");
     }
   }
-  return { writes: newWrites, returnsAt: write1.returnsAt.union(write2.returnsAt) };
+  const sp = write1.sp === "any" || write2.sp === "any" ? "any" : write1.sp === write2.sp ? write1.sp : "any";
+  return { writes: newWrites, returnsAt: write1.returnsAt.union(write2.returnsAt), sp };
 }
 
 function updateWrites(writeDataDest: WriteData, writeDataSrc: WriteData): boolean {
@@ -720,6 +724,7 @@ function updateWrites(writeDataDest: WriteData, writeDataSrc: WriteData): boolea
       changed = true;
     }
   }
+  writeDataDest.sp = writeDataSrc.sp;
   return changed;
 }
 
@@ -740,7 +745,7 @@ function inspectWrites(writeData: WriteData): string {
     }
     return "";
   });
-  return regEntries.join(", ");
+  return regEntries.join(", ") + ", sp=" + writeData.sp;
 }
 
 type LivenessResult = {
