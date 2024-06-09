@@ -4,6 +4,7 @@ async function main() {
   const origLines = parseLines(tokens);
   const [lines, consts] = extractConstants(origLines);
   const [instructions, labels, inverseLabels] = analyzeLabels(lines);
+  fixupLongJccHack(instructions, labels, inverseLabels);
   const writesFrom = analyzeWrites(instructions, labels);
   const functionEntries = markFunctions(instructions, labels, inverseLabels, writesFrom);
   const { instructionLiveness: livenessTable, functionReturns } = analyzeLiveness(instructions, labels, writesFrom);
@@ -885,6 +886,43 @@ function analyzeLabels(lines: (Label | Instruction)[]): [Instruction[], Map<stri
   }
   // throw away labels on the last
   return [instructions, labels, inverseLabels];
+}
+
+function fixupLongJccHack(instructions: Instruction[], labels: Map<string, number>, inverseLabels: Map<number, Label[]>) {
+  let labelCounter = 1;
+  function freshLabel(): string {
+    while (true) {
+      const labelName = `L${labelCounter.toString().padStart(4, "0")}`;
+      if (!labels.has(labelName)) {
+        return labelName;
+      }
+      labelCounter++;
+    }
+  }
+  for (let i = 0; i + 1 < instructions.length; i++) {
+    const instruction = instructions[i];
+    const nextInstruction = instructions[i + 1];
+    if (instruction.type === "JccInstruction" && nextInstruction.type === "JmpInstruction") {
+      const { target } = instruction;
+      if (
+        target.type === "BinOpOperand" &&
+        target.op === "+" &&
+        target.lhs.type === "VariableOperand" &&
+        target.lhs.name === "$" &&
+        target.rhs.type === "IntegerOperand" &&
+        target.rhs.digits === "5"
+      ) {
+        // Jcc $+5 followed by JMP
+        let label = inverseLabels.get(i + 2)?.[0]?.name;
+        if (label == null) {
+          label = freshLabel();
+          labels.set(label, i + 2);
+          inverseLabels.set(i + 2, [{ type: "Label", name: label, lineMetadata: { line: nextInstruction.lineMetadata.line, leadingComments: [], trailingComments: [] } }]);
+        }
+        instruction.target = { type: "VariableOperand", name: label };
+      }
+    }
+  }
 }
 
 type WriteData = {
