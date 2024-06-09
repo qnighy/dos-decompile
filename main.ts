@@ -159,10 +159,10 @@ type Instruction = {
   lineMetadata: LineMetadata;
 };
 
-type Operand = SimpleOperand | RegisterOperand | IntegerOperand | IndirectOperand | BinOpOperand | UnOpOperand | GarbageOperand;
-type SimpleOperand = {
-  type: "SimpleOperand";
-  value: string;
+type Operand = VariableOperand | RegisterOperand | IntegerOperand | IndirectOperand | BinOpOperand | UnOpOperand | GarbageOperand;
+type VariableOperand = {
+  type: "VariableOperand";
+  name: string;
 };
 type RegisterOperand = {
   type: "RegisterOperand";
@@ -321,8 +321,8 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         };
       } else if (/^[a-zA-Z][a-zA-Z0-9]*$/.test(token.text)) {
         return {
-          type: "SimpleOperand",
-          value: token.text,
+          type: "VariableOperand",
+          name: token.text,
         };
       } else if (/^[0-9]+$/.test(token.text)) {
         return {
@@ -365,7 +365,7 @@ function stringifyInstruction(instruction: Instruction): string {
 function stringifyOperand(operand: Operand, level = 2): string {
   let innerLevel = 0;
   switch (operand.type) {
-    case "SimpleOperand":
+    case "VariableOperand":
     case "RegisterOperand":
     case "IntegerOperand":
     case "IndirectOperand":
@@ -389,8 +389,8 @@ function stringifyOperand(operand: Operand, level = 2): string {
 }
 function stringifyOperandNoParen(operand: Operand): string {
   switch (operand.type) {
-    case "SimpleOperand":
-      return operand.value;
+    case "VariableOperand":
+      return operand.name;
     case "RegisterOperand":
       return operand.reg;
     case "IntegerOperand":
@@ -448,11 +448,11 @@ function stringifyOperandAsC(operand: Operand, level = 2): string {
 }
 function stringifyOperandAsCNoParen(operand: Operand): [string, number] {
   switch (operand.type) {
-    case "SimpleOperand":
-      if (/^[A-Za-z]/.test(operand.value)) {
-        return [operand.value, 1];
+    case "VariableOperand":
+      if (/^[A-Za-z]/.test(operand.name)) {
+        return [operand.name, 1];
       } else {
-        return [`asm("${escapeC(operand.value)}")`, 1];
+        return [`asm("${escapeC(operand.name)}")`, 1];
       }
     case "RegisterOperand":
       return [operand.reg, 1];
@@ -570,8 +570,8 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
         case "jmps":
           if (instruction.operands.length === 1) {
             const target = instruction.operands[0];
-            if (target.type === "SimpleOperand") {
-              const targetIndex = labels.get(target.value);
+            if (target.type === "VariableOperand") {
+              const targetIndex = labels.get(target.name);
               if (targetIndex !== undefined) {
                 newWriteData = writesFrom[targetIndex];
               }
@@ -610,8 +610,8 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
         case "jnc": {
           if (instruction.operands.length === 1) {
             const target = instruction.operands[0];
-            if (target.type === "SimpleOperand") {
-              const targetIndex = labels.get(target.value);
+            if (target.type === "VariableOperand") {
+              const targetIndex = labels.get(target.name);
               if (targetIndex !== undefined) {
                 newWriteData = mergeWrites(nextWriteData, writesFrom[targetIndex]);
               }
@@ -832,8 +832,8 @@ function markFunctions(instructions: Instruction[], labels: Map<string, number>,
       case "jmps":
         if (instruction.operands.length === 1) {
           const target = instruction.operands[0];
-          if (target.type === "SimpleOperand") {
-            const targetIndex = labels.get(target.value);
+          if (target.type === "VariableOperand") {
+            const targetIndex = labels.get(target.name);
             if (targetIndex !== undefined) {
               if (lastLabel !== undefined) {
                 labelGraph.get(lastLabel)!.push(targetIndex);
@@ -875,8 +875,8 @@ function markFunctions(instructions: Instruction[], labels: Map<string, number>,
       case "jnc": {
         if (instruction.operands.length === 1) {
           const target = instruction.operands[0];
-          if (target.type === "SimpleOperand") {
-            const targetIndex = labels.get(target.value);
+          if (target.type === "VariableOperand") {
+            const targetIndex = labels.get(target.name);
             if (targetIndex !== undefined) {
               if (lastLabel !== undefined) {
                 labelGraph.get(lastLabel)!.push(targetIndex);
@@ -894,8 +894,8 @@ function markFunctions(instructions: Instruction[], labels: Map<string, number>,
     const instruction = instructions[i];
     if (instruction.mnemonic === "call" && instruction.operands.length === 1) {
       const target = instruction.operands[0];
-      if (target.type === "SimpleOperand") {
-        const targetIndex = labels.get(target.value);
+      if (target.type === "VariableOperand") {
+        const targetIndex = labels.get(target.name);
         if (targetIndex !== undefined) {
           functionEntries.add(targetIndex);
         }
@@ -971,8 +971,8 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
       const instruction = instructions[i];
       if (instruction.mnemonic === "call" && instruction.operands.length === 1) {
         const target = instruction.operands[0];
-        if (target.type === "SimpleOperand") {
-          const targetIndex = labels.get(target.value);
+        if (target.type === "VariableOperand") {
+          const targetIndex = labels.get(target.name);
           if (targetIndex !== undefined) {
             processCall(targetIndex);
             if (callOriginMap.has(targetIndex)) {
@@ -1055,8 +1055,8 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
         case "call":
           if (instruction.operands.length === 1) {
             const target = instruction.operands[0];
-            if (target.type === "SimpleOperand") {
-              const targetIndex = labels.get(target.value);
+            if (target.type === "VariableOperand") {
+              const targetIndex = labels.get(target.name);
               if (targetIndex !== undefined) {
                 if (instruction.mnemonic === "call") {
                   const functionWrites = new Set(writesFrom[targetIndex].writes.keys());
@@ -1108,13 +1108,13 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
 
           if (instruction.operands.length === 1) {
             const target = instruction.operands[0];
-            if (target.type === "SimpleOperand") {
-              const targetIndex = labels.get(target.value);
+            if (target.type === "VariableOperand") {
+              const targetIndex = labels.get(target.name);
               if (targetIndex !== undefined) {
                 for (const reg of livenessTable[targetIndex].liveBefore) {
                   newLiveness.liveBefore.add(reg);
                 }
-              } else if (/^ret$/i.test(target.value)) {
+              } else if (/^ret$/i.test(target.name)) {
                 // Jcc RET ... specially handled by ASM
                 // TODO: integrate logic with RET
                 for (const functionEntry of returnOriginMap.get(i) ?? []) {
