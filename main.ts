@@ -152,7 +152,7 @@ type Label = {
   lineMetadata: LineMetadata;
 };
 
-type Instruction = GenericInstruction | MovInstruction | JmpInstruction;
+type Instruction = GenericInstruction | MovInstruction | JmpInstruction | JccInstruction;
 type GenericInstruction = {
   type: "Instruction";
   mnemonic: string;
@@ -332,7 +332,7 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         op: token.text,
         arg,
       };
-    } else if (/^[0-9a-zA-Z$]/.test(token.text)) {
+    } else if (/^[0-9a-zA-Z]/.test(token.text)) {
       i++;
       if (REG_NAMES.has(token.text.toLowerCase())) {
         return {
@@ -373,6 +373,12 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         type: "StringOperand",
         text: token.text.slice(1, token.text.length - 1),
       };
+    } else if (token.text === "$") {
+      i++;
+      return {
+        type: "VariableOperand",
+        name: "$",
+      };
     } else {
       i++;
       return {
@@ -395,6 +401,13 @@ type MovInstruction = {
 type JmpInstruction = {
   type: "JmpInstruction";
   mnemonic: string;
+  target: RegisterOperand | MemoryOperand | ImmediateOperand;
+  lineMetadata: LineMetadata;
+};
+type JccInstruction = {
+  type: "JccInstruction";
+  mnemonic: string;
+  condition: string;
   target: RegisterOperand | MemoryOperand | ImmediateOperand;
   lineMetadata: LineMetadata;
 };
@@ -424,6 +437,55 @@ class StructuredInstructionParseError extends Error {
   }
 }
 
+const JccMap = {
+  // CF
+  jc: "c",
+  jb: "c",
+  jnae: "c",
+  // !CF
+  jnc: "nc",
+  jnb: "nc",
+  jae: "nc",
+  // CF && ZF
+  ja: "a",
+  jnbe: "a",
+  // !CF || !ZF
+  jna: "na",
+  jbe: "na",
+  // SF ^ OF
+  jl: "l",
+  jnge: "l",
+  // !(SF ^ OF)
+  jge: "nl",
+  jnl: "nl",
+  // (SF ^ OF) || ZF
+  jle: "le",
+  jng: "le",
+  // !(SF ^ OF) && !ZF
+  jg: "nle",
+  jnle: "nle",
+  // ZF
+  je: "z",
+  jz: "z",
+  // !ZF
+  jne: "nz",
+  jnz: "nz",
+  // OF
+  jo: "o",
+  // !OF
+  jno: "no",
+  // SF
+  js: "s",
+  // !SF
+  jns: "ns",
+  // PF
+  jp: "p",
+  jpe: "p",
+  // !PF
+  jnp: "np",
+  jpo: "np",
+};
+
 function parseStructuredInstruction(instruction: GenericInstruction): Instruction {
   switch (instruction.mnemonic) {
     case "jp": // Considered an unconditional jump here
@@ -436,6 +498,49 @@ function parseStructuredInstruction(instruction: GenericInstruction): Instructio
       return {
         type: "JmpInstruction",
         mnemonic: instruction.mnemonic,
+        target,
+        lineMetadata: instruction.lineMetadata,
+      };
+    }
+    case "ja":
+    case "jna":
+    case "jbe":
+    case "jnbe":
+    case "jg":
+    case "jng":
+    case "jle":
+    case "jnle":
+    case "jge":
+    case "jnge":
+    case "jl":
+    case "jnl":
+    case "jo":
+    case "jno":
+    case "js":
+    case "jns":
+    case "je":
+    case "jne":
+    case "jz":
+    case "jnz":
+    // case "jp": // JP means JMP rel8 here rather than JPE
+    case "jnp":
+    case "jpe":
+    case "jpo":
+    case "jae":
+    case "jnae":
+    case "jb":
+    case "jnb":
+    case "jc":
+    case "jnc": {
+      if (instruction.operands.length !== 1) {
+        throw new StructuredInstructionParseError();
+      }
+      const condition = JccMap[instruction.mnemonic];
+      const target = parseRegisterOrMemoryOrImmediateOperand(instruction.operands[0]);
+      return {
+        type: "JccInstruction",
+        mnemonic: instruction.mnemonic,
+        condition,
         target,
         lineMetadata: instruction.lineMetadata,
       };
@@ -611,6 +716,10 @@ function stringifyInstruction(instruction: Instruction): string {
       operands = instruction.operands;
       break;
     case "JmpInstruction":
+      mnemonic = instruction.mnemonic;
+      operands = [instruction.target];
+      break;
+    case "JccInstruction":
       mnemonic = instruction.mnemonic;
       operands = [instruction.target];
       break;
@@ -832,6 +941,14 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
             newWriteData = writesFrom[targetIndex];
           }
         }
+      } else if (instruction.type === "JccInstruction") {
+        const { target } = instruction;
+        if (target.type === "VariableOperand") {
+          const targetIndex = labels.get(target.name);
+          if (targetIndex !== undefined) {
+            newWriteData = mergeWrites(nextWriteData, writesFrom[targetIndex]);
+          }
+        }
       } else if (instruction.type === "Instruction") {
         switch (instruction.mnemonic) {
           case "xchg":
@@ -859,47 +976,6 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
           case "ret":
             newWriteData = retWriteData(i);
             break;
-          case "ja":
-          case "jna":
-          case "jbe":
-          case "jnbe":
-          case "jg":
-          case "jng":
-          case "jle":
-          case "jnle":
-          case "jge":
-          case "jnge":
-          case "jl":
-          case "jnl":
-          case "jo":
-          case "jno":
-          case "js":
-          case "jns":
-          case "je":
-          case "jne":
-          case "jz":
-          case "jnz":
-          // case "jp":
-          case "jnp":
-          case "jpe":
-          case "jpo":
-          case "jae":
-          case "jnae":
-          case "jb":
-          case "jnb":
-          case "jc":
-          case "jnc": {
-            if (instruction.operands.length === 1) {
-              const target = instruction.operands[0];
-              if (target.type === "VariableOperand") {
-                const targetIndex = labels.get(target.name);
-                if (targetIndex !== undefined) {
-                  newWriteData = mergeWrites(nextWriteData, writesFrom[targetIndex]);
-                }
-              }
-            }
-            break;
-          }
           case "call":
             break;
           case "int":
@@ -1118,54 +1194,21 @@ function markFunctions(instructions: Instruction[], labels: Map<string, number>,
         }
       }
       lastLabel = undefined;
+    } else if (instruction.type === "JccInstruction") {
+      const { target } = instruction;
+      if (target.type === "VariableOperand") {
+        const targetIndex = labels.get(target.name);
+        if (targetIndex !== undefined) {
+          if (lastLabel !== undefined) {
+            labelGraph.get(lastLabel)!.push(targetIndex);
+          }
+        }
+      }
     } else {
       switch (instruction.mnemonic) {
         case "ret":
           lastLabel = undefined;
           break;
-        case "ja":
-        case "jna":
-        case "jbe":
-        case "jnbe":
-        case "jg":
-        case "jng":
-        case "jle":
-        case "jnle":
-        case "jge":
-        case "jnge":
-        case "jl":
-        case "jnl":
-        case "jo":
-        case "jno":
-        case "js":
-        case "jns":
-        case "je":
-        case "jne":
-        case "jz":
-        case "jnz":
-        // case "jp":
-        case "jnp":
-        case "jpe":
-        case "jpo":
-        case "jae":
-        case "jnae":
-        case "jb":
-        case "jnb":
-        case "jc":
-        case "jnc": {
-          if (instruction.operands.length === 1) {
-            const target = instruction.operands[0];
-            if (target.type === "VariableOperand") {
-              const targetIndex = labels.get(target.name);
-              if (targetIndex !== undefined) {
-                if (lastLabel !== undefined) {
-                  labelGraph.get(lastLabel)!.push(targetIndex);
-                }
-              }
-            }
-          }
-          break;
-        }
       }
     }
   }
@@ -1311,6 +1354,38 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
             }
           }
         }
+      } else if (instruction.type === "JccInstruction") {
+        newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
+        // Check condition flags
+        const [src] = instructionIO(instruction);
+        for (const reg of src) {
+          newLiveness.liveBefore.add(reg);
+        }
+
+        const { target } = instruction;
+        if (target.type === "VariableOperand") {
+          const targetIndex = labels.get(target.name);
+          if (targetIndex !== undefined) {
+            for (const reg of livenessTable[targetIndex].liveBefore) {
+              newLiveness.liveBefore.add(reg);
+            }
+          } else if (/^ret$/i.test(target.name)) {
+            // Jcc RET ... specially handled by ASM
+            // TODO: integrate logic with RET
+            for (const functionEntry of returnOriginMap.get(i) ?? []) {
+              const functionWrites = new Set(writesFrom[functionEntry].writes.keys());
+              for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
+                if (callIndex + 1 >= instructions.length) {
+                  continue;
+                }
+                const innerLiveness = livenessTable[callIndex + 1].liveBefore.intersection(functionWrites);
+                for (const reg of innerLiveness) {
+                  newLiveness.liveBefore.add(reg);
+                }
+              }
+            }
+          }
+        }
       } else if (instruction.type === "Instruction") {
         switch (instruction.mnemonic) {
           // case "xchg":
@@ -1362,71 +1437,6 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
               }
             }
             break;
-          case "ja":
-          case "jna":
-          case "jbe":
-          case "jnbe":
-          case "jg":
-          case "jng":
-          case "jle":
-          case "jnle":
-          case "jge":
-          case "jnge":
-          case "jl":
-          case "jnl":
-          case "jo":
-          case "jno":
-          case "js":
-          case "jns":
-          case "je":
-          case "jne":
-          case "jz":
-          case "jnz":
-          // case "jp":
-          case "jnp":
-          case "jpe":
-          case "jpo":
-          case "jae":
-          case "jnae":
-          case "jb":
-          case "jnb":
-          case "jc":
-          case "jnc": {
-            newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
-            // Check condition flags
-            const [src] = instructionIO(instruction);
-            for (const reg of src) {
-              newLiveness.liveBefore.add(reg);
-            }
-
-            if (instruction.operands.length === 1) {
-              const target = instruction.operands[0];
-              if (target.type === "VariableOperand") {
-                const targetIndex = labels.get(target.name);
-                if (targetIndex !== undefined) {
-                  for (const reg of livenessTable[targetIndex].liveBefore) {
-                    newLiveness.liveBefore.add(reg);
-                  }
-                } else if (/^ret$/i.test(target.name)) {
-                  // Jcc RET ... specially handled by ASM
-                  // TODO: integrate logic with RET
-                  for (const functionEntry of returnOriginMap.get(i) ?? []) {
-                    const functionWrites = new Set(writesFrom[functionEntry].writes.keys());
-                    for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
-                      if (callIndex + 1 >= instructions.length) {
-                        continue;
-                      }
-                      const innerLiveness = livenessTable[callIndex + 1].liveBefore.intersection(functionWrites);
-                      for (const reg of innerLiveness) {
-                        newLiveness.liveBefore.add(reg);
-                      }
-                    }
-                  }
-                }
-              }
-            }
-            break;
-          }
           // case "int":
           //   break;
         }
@@ -1638,6 +1648,43 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
   } else if (inst.type === "JmpInstruction") {
     // Should be handled by the caller
     return [[], []];
+  } else if (inst.type === "JccInstruction") {
+    switch (inst.condition) {
+      // CF or its negation
+      case "c":
+      case "nc":
+        return [["cf"], []];
+      // CF && ZF or its negation
+      case "a":
+      case "na":
+        return [["cf", "zf"], []];
+      // SF ^ OF or its negation
+      case "l":
+      case "nl":
+        return [["of", "sf"], []];
+      // (SF ^ OF) || ZF or its negation
+      case "le":
+      case "nle":
+        return [["of", "sf", "zf"], []];
+      // ZF or its negation
+      case "z":
+      case "nz":
+        return [["zf"], []];
+      // OF or its negation
+      case "o":
+      case "no":
+        return [["of"], []];
+      // SF or its negation
+      case "s":
+      case "ns":
+        return [["sf"], []];
+      // PF or its negation
+      case "p":
+      case "np":
+        return [["pf"], []];
+      default:
+        throw new Error("Unknown condition: " + inst.condition);
+    }
   } else {
     switch (inst.mnemonic) {
       case "add":
@@ -1698,44 +1745,6 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
       case "int":
         // Should be handled by the caller
         return [[], []];
-      case "ja":
-      case "jna":
-      case "jbe":
-      case "jnbe":
-        return [["cf", "zf"], []];
-      case "jg":
-      case "jng":
-      case "jle":
-      case "jnle":
-        return [["of", "sf", "zf"], []];
-      case "jge":
-      case "jnge":
-      case "jl":
-      case "jnl":
-        return [["of", "sf"], []];
-      case "jo":
-      case "jno":
-        return [["of"], []];
-      case "js":
-      case "jns":
-        return [["sf"], []];
-      case "je":
-      case "jne":
-      case "jz":
-      case "jnz":
-        return [["zf"], []];
-      // case "jp":
-      case "jnp":
-      case "jpe":
-      case "jpo":
-        return [["pf"], []];
-      case "jae":
-      case "jnae":
-      case "jb":
-      case "jnb":
-      case "jc":
-      case "jnc":
-        return [["cf"], []];
       case "lahf":
         return [["sf", "zf", "af", "pf", "cf"], ["ah"]];
       case "sahf":
