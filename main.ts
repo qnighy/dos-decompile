@@ -157,10 +157,19 @@ type Instruction = {
   trailingComments: string[];
 };
 
-type Operand = SimpleOperand | IndirectOperand | BinOpOperand | UnOpOperand;
+type Operand = SimpleOperand | RegisterOperand | IntegerOperand | IndirectOperand | BinOpOperand | UnOpOperand;
 type SimpleOperand = {
   type: "SimpleOperand";
   value: string;
+};
+type RegisterOperand = {
+  type: "RegisterOperand";
+  reg: string;
+};
+type IntegerOperand = {
+  type: "IntegerOperand";
+  digits: string;
+  base: number;
 };
 type IndirectOperand = {
   type: "IndirectOperand";
@@ -291,6 +300,25 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
       };
     } else if (/^[0-9a-zA-Z'"$]/.test(token.text)) {
       i++;
+      if (REG_NAMES.has(token.text.toLowerCase())) {
+        return {
+          type: "RegisterOperand",
+          reg: token.text.toLowerCase(),
+        };
+      }
+      if (/^[0-9]+$/.test(token.text)) {
+        return {
+          type: "IntegerOperand",
+          digits: token.text,
+          base: 10,
+        };
+      } else if (/^[0-9][0-9A-F]*H$/i.test(token.text)) {
+        return {
+          type: "IntegerOperand",
+          digits: token.text.slice(0, token.text.length - 1),
+          base: 16,
+        };
+      }
       return {
         type: "SimpleOperand",
         value: token.text,
@@ -320,6 +348,8 @@ function stringifyOperand(operand: Operand, level = 2): string {
   let innerLevel = 0;
   switch (operand.type) {
     case "SimpleOperand":
+    case "RegisterOperand":
+    case "IntegerOperand":
     case "IndirectOperand":
       innerLevel = 1;
       break;
@@ -340,6 +370,10 @@ function stringifyOperandNoParen(operand: Operand): string {
   switch (operand.type) {
     case "SimpleOperand":
       return operand.value;
+    case "RegisterOperand":
+      return operand.reg;
+    case "IntegerOperand":
+      return operand.base === 16 ? `${operand.digits}H` : operand.digits;
     case "IndirectOperand":
       return `[${stringifyOperand(operand.address, 2)}]`;
     case "BinOpOperand":
@@ -394,13 +428,13 @@ function stringifyOperandAsCNoParen(operand: Operand): [string, number] {
     case "SimpleOperand":
       if (/^[A-Za-z]/.test(operand.value)) {
         return [operand.value, 1];
-      } else if (/^[0-9]+$/.test(operand.value)) {
-        return [operand.value.replace(/^0+(?=[1-9])/, ""), 1];
-      } else if (/^[0-9A-F]+H$/i.test(operand.value)) {
-        return [`0x${operand.value.slice(0, operand.value.length - 1)}`, 1];
       } else {
         return [`asm("${escapeC(operand.value)}")`, 1];
       }
+    case "RegisterOperand":
+      return [operand.reg, 1];
+    case "IntegerOperand":
+      return [operand.base === 16 ? `0x${operand.digits}` : operand.digits.replace(/^0+(?=[1-9])/, ""), 1];
     case "IndirectOperand":
       return [`[${stringifyOperandAsC(operand, 2)}]`, 1];
     case "BinOpOperand":
@@ -1218,11 +1252,8 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
       search(op);
     }
     function search(op: Operand) {
-      if (op.type === "SimpleOperand") {
-        const reg = asRegister(op);
-        if (reg) {
-          deps.add(reg);
-        }
+      if (op.type === "RegisterOperand") {
+        deps.add(op.reg);
       } else if (op.type === "IndirectOperand") {
         search(op.address);
       } else if (op.type === "BinOpOperand") {
@@ -1239,7 +1270,7 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
       return false;
     }
     const [dest, src] = inst.operands;
-    return dest.type === "SimpleOperand" && src.type === "SimpleOperand" && dest.value === src.value;
+    return dest.type === "RegisterOperand" && src.type === "RegisterOperand" && dest.reg === src.reg;
   }
   switch (inst.mnemonic) {
     case "add":
@@ -1431,11 +1462,8 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
   }
 }
 function asRegister(operand: Operand): string | undefined {
-  if (operand.type === "SimpleOperand") {
-    const reg = operand.value.toLowerCase();
-    if (REG_NAMES.has(reg)) {
-      return reg;
-    }
+  if (operand.type === "RegisterOperand") {
+    operand.reg;
   }
   return undefined;
 }
