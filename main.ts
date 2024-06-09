@@ -152,7 +152,7 @@ type Label = {
   lineMetadata: LineMetadata;
 };
 
-type Instruction = GenericInstruction | MovInstruction;
+type Instruction = GenericInstruction | MovInstruction | JmpInstruction;
 type GenericInstruction = {
   type: "Instruction";
   mnemonic: string;
@@ -392,6 +392,12 @@ type MovInstruction = {
   src: RegisterOperand | MemoryOperand | ImmediateOperand;
   lineMetadata: LineMetadata;
 };
+type JmpInstruction = {
+  type: "JmpInstruction";
+  mnemonic: string;
+  target: RegisterOperand | MemoryOperand | ImmediateOperand;
+  lineMetadata: LineMetadata;
+};
 type MemoryOperand = {
   type: "MemoryOperand";
   baseReg: string | undefined;
@@ -420,6 +426,20 @@ class StructuredInstructionParseError extends Error {
 
 function parseStructuredInstruction(instruction: GenericInstruction): Instruction {
   switch (instruction.mnemonic) {
+    case "jp": // Considered an unconditional jump here
+    case "jmp":
+    case "jmps": {
+      if (instruction.operands.length !== 1) {
+        throw new StructuredInstructionParseError();
+      }
+      const target = parseRegisterOrMemoryOrImmediateOperand(instruction.operands[0]);
+      return {
+        type: "JmpInstruction",
+        mnemonic: instruction.mnemonic,
+        target,
+        lineMetadata: instruction.lineMetadata,
+      };
+    }
     case "mov": {
       if (instruction.operands.length !== 2 && instruction.operands.length !== 3) {
         throw new StructuredInstructionParseError();
@@ -589,6 +609,10 @@ function stringifyInstruction(instruction: Instruction): string {
     case "Instruction":
       mnemonic = instruction.mnemonic;
       operands = instruction.operands;
+      break;
+    case "JmpInstruction":
+      mnemonic = instruction.mnemonic;
+      operands = [instruction.target];
       break;
     case "MovInstruction":
       mnemonic = "mov";
@@ -800,6 +824,14 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
           }
           newWriteData = seqWrites(nextWriteData, mapping);
         }
+      } else if (instruction.type === "JmpInstruction") {
+        const { target } = instruction;
+        if (target.type === "VariableOperand") {
+          const targetIndex = labels.get(target.name);
+          if (targetIndex !== undefined) {
+            newWriteData = writesFrom[targetIndex];
+          }
+        }
       } else if (instruction.type === "Instruction") {
         switch (instruction.mnemonic) {
           case "xchg":
@@ -826,19 +858,6 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
           }
           case "ret":
             newWriteData = retWriteData(i);
-            break;
-          case "jp": // Considered an unconditional jump here
-          case "jmp":
-          case "jmps":
-            if (instruction.operands.length === 1) {
-              const target = instruction.operands[0];
-              if (target.type === "VariableOperand") {
-                const targetIndex = labels.get(target.name);
-                if (targetIndex !== undefined) {
-                  newWriteData = writesFrom[targetIndex];
-                }
-              }
-            }
             break;
           case "ja":
           case "jna":
@@ -1088,25 +1107,20 @@ function markFunctions(instructions: Instruction[], labels: Map<string, number>,
     const instruction = instructions[i];
     if (instruction.type === "MovInstruction") {
       //
+    } else if (instruction.type === "JmpInstruction") {
+      const { target } = instruction;
+      if (target.type === "VariableOperand") {
+        const targetIndex = labels.get(target.name);
+        if (targetIndex !== undefined) {
+          if (lastLabel !== undefined) {
+            labelGraph.get(lastLabel)!.push(targetIndex);
+          }
+        }
+      }
+      lastLabel = undefined;
     } else {
       switch (instruction.mnemonic) {
         case "ret":
-          lastLabel = undefined;
-          break;
-        case "jp": // Considered an unconditional jump here
-        case "jmp":
-        case "jmps":
-          if (instruction.operands.length === 1) {
-            const target = instruction.operands[0];
-            if (target.type === "VariableOperand") {
-              const targetIndex = labels.get(target.name);
-              if (targetIndex !== undefined) {
-                if (lastLabel !== undefined) {
-                  labelGraph.get(lastLabel)!.push(targetIndex);
-                }
-              }
-            }
-          }
           lastLabel = undefined;
           break;
         case "ja":
@@ -1283,6 +1297,20 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
       let newLiveness: InstructionLiveness | undefined = undefined;
       if (instruction.type === "MovInstruction") {
         //
+      } else if (instruction.type === "JmpInstruction") {
+        const { target } = instruction;
+        if (target.type === "VariableOperand") {
+          const targetIndex = labels.get(target.name);
+          if (targetIndex !== undefined) {
+            if (instruction.mnemonic === "call") {
+              const functionWrites = new Set(writesFrom[targetIndex].writes.keys());
+              const preservedRegs = livenessNext.liveBefore.difference(functionWrites);
+              newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore.union(preservedRegs) };
+            } else {
+              newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore };
+            }
+          }
+        }
       } else if (instruction.type === "Instruction") {
         switch (instruction.mnemonic) {
           // case "xchg":
@@ -1316,10 +1344,8 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
               }
             }
             break;
-          case "jp": // Considered an unconditional jump here
-          case "jmp":
-          case "jmps":
           case "call":
+            // Same as JMP
             if (instruction.operands.length === 1) {
               const target = instruction.operands[0];
               if (target.type === "VariableOperand") {
@@ -1609,6 +1635,9 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
   if (inst.type === "MovInstruction") {
     const { dest, src } = inst;
     return [operandAsSrc(src), operandAsDest(dest)];
+  } else if (inst.type === "JmpInstruction") {
+    // Should be handled by the caller
+    return [[], []];
   } else {
     switch (inst.mnemonic) {
       case "add":
@@ -1667,11 +1696,6 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
       case "inc":
         return [[...src(inst)], [...dest(inst), "of", "sf", "zf", "af", "pf"]];
       case "int":
-        // Should be handled by the caller
-        return [[], []];
-      case "jp": // Considered an unconditional jump here
-      case "jmp":
-      case "jmps":
         // Should be handled by the caller
         return [[], []];
       case "ja":
