@@ -159,7 +159,7 @@ type Instruction = {
   lineMetadata: LineMetadata;
 };
 
-type Operand = SimpleOperand | RegisterOperand | IntegerOperand | IndirectOperand | BinOpOperand | UnOpOperand;
+type Operand = SimpleOperand | RegisterOperand | IntegerOperand | IndirectOperand | BinOpOperand | UnOpOperand | GarbageOperand;
 type SimpleOperand = {
   type: "SimpleOperand";
   value: string;
@@ -187,6 +187,10 @@ type UnOpOperand = {
   type: "UnOpOperand";
   op: string;
   arg: Operand;
+};
+type GarbageOperand = {
+  type: "GarbageOperand";
+  message: string;
 };
 
 function parseLines(tokens: Token[]): (Label | Instruction)[] {
@@ -276,8 +280,8 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
   function parseOperand1(): Operand {
     if (i >= tokens.length) {
       return {
-        type: "SimpleOperand",
-        value: "garbage:EOL",
+        type: "GarbageOperand",
+        message: "End of line",
       };
     }
     const token = tokens[i];
@@ -286,13 +290,13 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
       const address = parseOperand2();
       if (i >= tokens.length) {
         return {
-          type: "SimpleOperand",
-          value: "garbage:[EOL",
+          type: "GarbageOperand",
+          message: "Unclosed bracket: EOL",
         };
       } else if (tokens[i].text !== "]") {
         return {
-          type: "SimpleOperand",
-          value: "garbage:[" + tokens[i].text,
+          type: "GarbageOperand",
+          message: `Unclosed bracket: found: ${tokens[i].text}`,
         };
       }
       i++;
@@ -315,8 +319,12 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
           type: "RegisterOperand",
           reg: token.text.toLowerCase(),
         };
-      }
-      if (/^[0-9]+$/.test(token.text)) {
+      } else if (/^[a-zA-Z][a-zA-Z0-9]*$/.test(token.text)) {
+        return {
+          type: "SimpleOperand",
+          value: token.text,
+        };
+      } else if (/^[0-9]+$/.test(token.text)) {
         return {
           type: "IntegerOperand",
           digits: token.text,
@@ -330,14 +338,14 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         };
       }
       return {
-        type: "SimpleOperand",
-        value: token.text,
+        type: "GarbageOperand",
+        message: `Invalid operand: ${token.text}`,
       };
     } else {
       i++;
       return {
-        type: "SimpleOperand",
-        value: "garbage:" + token.text,
+        type: "GarbageOperand",
+        message: `Invalid operand: ${token.text}`,
       };
     }
   }
@@ -369,6 +377,9 @@ function stringifyOperand(operand: Operand, level = 2): string {
     case "UnOpOperand":
       innerLevel = 1;
       break;
+    case "GarbageOperand":
+      innerLevel = 1;
+      break;
   }
   if (innerLevel <= level) {
     return stringifyOperandNoParen(operand);
@@ -390,6 +401,8 @@ function stringifyOperandNoParen(operand: Operand): string {
       return `${stringifyOperand(operand.lhs, 2)} ${operand.op} ${stringifyOperand(operand.rhs, 1)}`;
     case "UnOpOperand":
       return `${operand.op}${stringifyOperand(operand.arg, 2)}`;
+    case "GarbageOperand":
+      return `<<GARBAGE: ${operand.message}>>`;
   }
 }
 
@@ -451,6 +464,8 @@ function stringifyOperandAsCNoParen(operand: Operand): [string, number] {
       return [`${stringifyOperandAsC(operand.lhs, 2)} ${operand.op} ${stringifyOperandAsC(operand.rhs, 1)}`, 2];
     case "UnOpOperand":
       return [`${operand.op}${stringifyOperandAsC(operand.arg, 2)}`, 2];
+    case "GarbageOperand":
+      return [`<<GARBAGE: ${operand.message}>>`, 1];
   }
 }
 
