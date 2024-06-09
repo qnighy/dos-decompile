@@ -10,13 +10,13 @@ async function main() {
 
   let cText = "";
   for (const constDecl of consts.values()) {
-    for (const leadingComment of constDecl.leadingComments) {
+    for (const leadingComment of constDecl.lineMetadata.leadingComments) {
       cText += `// ${leadingComment}\n`;
     }
     cText += `const int ${constDecl.name} = ${stringifyOperandAsC(constDecl.value)};`;
-    if (constDecl.trailingComments.length > 0) {
+    if (constDecl.lineMetadata.trailingComments.length > 0) {
       cText += " //";
-      for (const trailingComment of constDecl.trailingComments) {
+      for (const trailingComment of constDecl.lineMetadata.trailingComments) {
         cText += ` ${trailingComment}`;
       }
     }
@@ -31,28 +31,28 @@ async function main() {
       cText += `// returns: ${Array.from(functionReturns.get(i)!).join(", ")}\n`;
     }
     for (const label of inverseLabels.get(i) || []) {
-      for (const leadingComment of label.leadingComments) {
+      for (const leadingComment of label.lineMetadata.leadingComments) {
         cText += `  // ${leadingComment}\n`;
       }
       cText += `${label.name}:`;
-      if (label.trailingComments.length > 0) {
+      if (label.lineMetadata.trailingComments.length > 0) {
         cText += " //";
-        for (const trailingComment of label.trailingComments) {
+        for (const trailingComment of label.lineMetadata.trailingComments) {
           cText += ` ${trailingComment}`;
         }
       }
       cText += "\n";
     }
     const instruction = instructions[i];
-    for (const leadingComment of instruction.leadingComments) {
+    for (const leadingComment of instruction.lineMetadata.leadingComments) {
       cText += `  // ${leadingComment}\n`;
     }
     cText += `  // writes: ${inspectWrites(writesFrom[i])}\n`;
     cText += `  // liveness: ${Array.from(livenessTable[i].liveBefore).join(", ")}\n`;
     cText += `  asm("${escapeC(stringifyInstruction(instruction))}");`;
-    if (instruction.trailingComments.length > 0) {
+    if (instruction.lineMetadata.trailingComments.length > 0) {
       cText += " //";
-      for (const trailingComment of instruction.trailingComments) {
+      for (const trailingComment of instruction.lineMetadata.trailingComments) {
         cText += ` ${trailingComment}`;
       }
     }
@@ -140,21 +140,23 @@ function tokenize(text: string) {
   return tokens;
 }
 
-type Label = {
-  type: "Label";
-  name: string;
+type LineMetadata = {
   line: number;
   leadingComments: string[];
   trailingComments: string[];
+};
+
+type Label = {
+  type: "Label";
+  name: string;
+  lineMetadata: LineMetadata;
 };
 
 type Instruction = {
   type: "Instruction";
   mnemonic: string;
   operands: Operand[];
-  line: number;
-  leadingComments: string[];
-  trailingComments: string[];
+  lineMetadata: LineMetadata;
 };
 
 type Operand = SimpleOperand | RegisterOperand | IntegerOperand | IndirectOperand | BinOpOperand | UnOpOperand;
@@ -195,9 +197,11 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
       lines.push({
         type: "Label",
         name: tokens[i].text,
-        line: tokens[i].line,
-        leadingComments: tokens[i].leadingComments,
-        trailingComments: tokens[i + 1].trailingComments,
+        lineMetadata: {
+          line: tokens[i].line,
+          leadingComments: tokens[i].leadingComments,
+          trailingComments: tokens[i + 1].trailingComments,
+        }
       });
       i += 2;
       continue;
@@ -206,9 +210,11 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
       lines.push({
         type: "Label",
         name: tokens[i].text,
-        line: tokens[i].line,
-        leadingComments: tokens[i].leadingComments,
-        trailingComments: tokens[i].trailingComments,
+        lineMetadata: {
+          line: tokens[i].line,
+          leadingComments: tokens[i].leadingComments,
+          trailingComments: tokens[i].trailingComments,
+        }
       });
       i += 1;
       continue;
@@ -229,9 +235,11 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         type: "Instruction",
         mnemonic: mnemonicToken.text.toLowerCase(),
         operands,
-        line: mnemonicToken.line,
-        leadingComments: mnemonicToken.leadingComments,
-        trailingComments: tokens[i - 1].trailingComments,
+        lineMetadata: {
+          line: mnemonicToken.line,
+          leadingComments: mnemonicToken.leadingComments,
+          trailingComments: tokens[i - 1].trailingComments,
+        }
       });
     } else if (tokens[i].text === "\n") {
       i++;
@@ -241,9 +249,11 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         type: "Instruction",
         mnemonic: "garbage:" + tokens[i].text,
         operands: [],
-        line: tokens[i].line,
-        leadingComments: tokens[i].leadingComments,
-        trailingComments: tokens[i].trailingComments,
+        lineMetadata: {
+          line: tokens[i].line,
+          leadingComments: tokens[i].leadingComments,
+          trailingComments: tokens[i].trailingComments,
+        },
       });
       i++;
     }
@@ -386,9 +396,7 @@ function stringifyOperandNoParen(operand: Operand): string {
 type Constant = {
   name: string;
   value: Operand;
-  line: number;
-  leadingComments: string[];
-  trailingComments: string[];
+  lineMetadata: LineMetadata;
 };
 
 function extractConstants(lines: (Label | Instruction)[]): [(Label | Instruction)[], Map<string, Constant>] {
@@ -402,9 +410,11 @@ function extractConstants(lines: (Label | Instruction)[]): [(Label | Instruction
         consts.set(line.name, {
           name: line.name,
           value: nextLine.operands[0],
-          line: nextLine.line,
-          leadingComments: [...line.leadingComments, ...nextLine.leadingComments],
-          trailingComments: [...line.trailingComments, ...nextLine.trailingComments],
+          lineMetadata: {
+            line: nextLine.lineMetadata.line,
+            leadingComments: [...line.lineMetadata.leadingComments, ...nextLine.lineMetadata.leadingComments],
+            trailingComments: [...line.lineMetadata.trailingComments, ...nextLine.lineMetadata.trailingComments],
+          },
         });
         i++;
         continue;
