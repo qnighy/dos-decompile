@@ -152,14 +152,16 @@ type Label = {
   lineMetadata: LineMetadata;
 };
 
-type Instruction = {
+type Instruction = GenericInstruction | MovInstruction;
+type GenericInstruction = {
   type: "Instruction";
   mnemonic: string;
   operands: Operand[];
   lineMetadata: LineMetadata;
 };
 
-type Operand = VariableOperand | RegisterOperand | IntegerOperand | IndirectOperand | BinOpOperand | UnOpOperand | GarbageOperand;
+type Operand = VariableOperand | RegisterOperand | IntegerOperand | StringOperand | IndirectOperand | BinOpOperand | UnOpOperand | GarbageOperand;
+type OperandExt = Operand | MemoryOperand;
 type VariableOperand = {
   type: "VariableOperand";
   name: string;
@@ -172,6 +174,10 @@ type IntegerOperand = {
   type: "IntegerOperand";
   digits: string;
   base: number;
+};
+type StringOperand = {
+  type: "StringOperand";
+  text: string;
 };
 type IndirectOperand = {
   type: "IndirectOperand";
@@ -223,28 +229,18 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
       i += 1;
       continue;
     } else if (/^[a-zA-Z]/.test(tokens[i].text)) {
-      const mnemonicToken = tokens[i];
-      i++;
-      const operands: Operand[] = [];
-      while (i < tokens.length && tokens[i].text !== "\n") {
-        const operand = parseOperand2();
-        operands.push(operand);
-        if (i < tokens.length && tokens[i].text === ",") {
-          i++;
+      const genericInstruction = parseGenericInstruction();
+      let instruction: Instruction = genericInstruction;
+      try {
+        instruction = parseStructuredInstruction(genericInstruction);
+      } catch (e) {
+        if (e instanceof StructuredInstructionParseError) {
+          // ignore
         } else {
-          break;
+          throw e;
         }
       }
-      lines.push({
-        type: "Instruction",
-        mnemonic: mnemonicToken.text.toLowerCase(),
-        operands,
-        lineMetadata: {
-          line: mnemonicToken.line,
-          leadingComments: mnemonicToken.leadingComments,
-          trailingComments: tokens[i - 1].trailingComments,
-        }
-      });
+      lines.push(instruction);
     } else if (tokens[i].text === "\n") {
       i++;
     } else {
@@ -261,6 +257,30 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
       });
       i++;
     }
+  }
+  function parseGenericInstruction(): GenericInstruction {
+    const mnemonicToken = tokens[i];
+    i++;
+    const operands: Operand[] = [];
+    while (i < tokens.length && tokens[i].text !== "\n") {
+      const operand = parseOperand2();
+      operands.push(operand);
+      if (i < tokens.length && tokens[i].text === ",") {
+        i++;
+      } else {
+        break;
+      }
+    }
+    return {
+      type: "Instruction",
+      mnemonic: mnemonicToken.text.toLowerCase(),
+      operands,
+      lineMetadata: {
+        line: mnemonicToken.line,
+        leadingComments: mnemonicToken.leadingComments,
+        trailingComments: tokens[i - 1].trailingComments,
+      }
+    };
   }
   function parseOperand2(): Operand {
     let operand = parseOperand1();
@@ -312,7 +332,7 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         op: token.text,
         arg,
       };
-    } else if (/^[0-9a-zA-Z'"$]/.test(token.text)) {
+    } else if (/^[0-9a-zA-Z$]/.test(token.text)) {
       i++;
       if (REG_NAMES.has(token.text.toLowerCase())) {
         return {
@@ -341,6 +361,18 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
         type: "GarbageOperand",
         message: `Invalid operand: ${token.text}`,
       };
+    } else if (/^'.*'$/.test(token.text)) {
+      i++;
+      return {
+        type: "StringOperand",
+        text: token.text.slice(1, token.text.length - 1),
+      };
+    } else if (/^".*"$/.test(token.text)) {
+      i++;
+      return {
+        type: "StringOperand",
+        text: token.text.slice(1, token.text.length - 1),
+      };
     } else {
       i++;
       return {
@@ -353,22 +385,233 @@ function parseLines(tokens: Token[]): (Label | Instruction)[] {
   return lines;
 }
 
+type MovInstruction = {
+  type: "MovInstruction";
+  mnemonic: string;
+  dest: RegisterOperand | MemoryOperand;
+  src: RegisterOperand | MemoryOperand | ImmediateOperand;
+  lineMetadata: LineMetadata;
+};
+type MemoryOperand = {
+  type: "MemoryOperand";
+  baseReg: string | undefined;
+  indexReg: string | undefined;
+  // scale: number;
+  disp: ImmediateOperand | undefined;
+};
+type ImmediateOperand = VariableOperand | IntegerOperand | StringOperand | ConstantBinOpOperand | ConstantUnOpOperand;
+type ConstantBinOpOperand = {
+  type: "BinOpOperand";
+  op: string;
+  lhs: ImmediateOperand;
+  rhs: ImmediateOperand;
+};
+type ConstantUnOpOperand = {
+  type: "UnOpOperand";
+  op: string;
+  arg: ImmediateOperand;
+};
+
+class StructuredInstructionParseError extends Error {
+  static {
+    this.prototype.name = "StructuredInstructionParseError";
+  }
+}
+
+function parseStructuredInstruction(instruction: GenericInstruction): Instruction {
+  switch (instruction.mnemonic) {
+    case "mov": {
+      if (instruction.operands.length !== 2 && instruction.operands.length !== 3) {
+        throw new StructuredInstructionParseError();
+      }
+      const destPos = instruction.operands.length - 2;
+      const srcPos = instruction.operands.length - 1;
+      // TODO: process operand size
+      const dest = parseRegisterOrMemoryOperand(instruction.operands[destPos]);
+      const src = parseRegisterOrMemoryOrImmediateOperand(instruction.operands[srcPos]);
+      return {
+        type: "MovInstruction",
+        mnemonic: "mov",
+        dest,
+        src,
+        lineMetadata: instruction.lineMetadata,
+      };
+    }
+  }
+  throw new StructuredInstructionParseError();
+}
+function parseRegisterOrMemoryOperand(operand: Operand): RegisterOperand | MemoryOperand {
+  if (operand.type === "RegisterOperand") {
+    return operand;
+  } else if (operand.type === "IndirectOperand") {
+    return parseMemoryOperand(operand);
+  }
+  throw new StructuredInstructionParseError();
+}
+function parseRegisterOrMemoryOrImmediateOperand(operand: Operand): RegisterOperand | MemoryOperand | ImmediateOperand {
+  if (operand.type === "RegisterOperand") {
+    return operand;
+  } else if (operand.type === "IndirectOperand") {
+    return parseMemoryOperand(operand);
+  }
+  return parseImmediateOperand(operand);
+}
+function parseMemoryOperand(operand: Operand): MemoryOperand {
+  if (operand.type === "IndirectOperand") {
+    return parseMemoryOperandFromAddressPart(operand.address);
+  }
+  throw new StructuredInstructionParseError();
+}
+function parseMemoryOperandFromAddressPart(operand: Operand): MemoryOperand {
+  switch (operand.type) {
+    case "VariableOperand":
+    case "IntegerOperand":
+    case "StringOperand": {
+      return {
+        type: "MemoryOperand",
+        baseReg: undefined,
+        indexReg: undefined,
+        disp: operand,
+      };
+    }
+    case "RegisterOperand": {
+      if (operand.reg === "bx" || operand.reg === "bp") {
+        return {
+          type: "MemoryOperand",
+          baseReg: operand.reg,
+          indexReg: undefined,
+          disp: undefined,
+        };
+      } else if (operand.reg === "si" || operand.reg === "di") {
+        return {
+          type: "MemoryOperand",
+          baseReg: undefined,
+          indexReg: operand.reg,
+          disp: undefined,
+        };
+      }
+      break;
+    }
+    case "UnOpOperand": {
+      const arg = parseMemoryOperandFromAddressPart(operand.arg);
+      if (operand.op === "+") {
+        return arg;
+      }
+      if (arg.baseReg != null || arg.indexReg != null) {
+        throw new StructuredInstructionParseError();
+      }
+      if (arg.disp == null) {
+        throw new StructuredInstructionParseError();
+      }
+      return {
+        type: "MemoryOperand",
+        baseReg: undefined,
+        indexReg: undefined,
+        disp: {
+          type: "UnOpOperand",
+          op: operand.op,
+          arg: arg.disp,
+        },
+      };
+    }
+    case "BinOpOperand": {
+      const lhs = parseMemoryOperandFromAddressPart(operand.lhs);
+      const rhs = parseMemoryOperandFromAddressPart(operand.rhs);
+      if (
+        (lhs.baseReg != null && rhs.baseReg != null) ||
+        (lhs.indexReg != null && rhs.indexReg != null)
+      ) {
+        throw new StructuredInstructionParseError();
+      }
+      if (operand.op === "-" && (rhs.baseReg != null || lhs.baseReg != null)) {
+        throw new StructuredInstructionParseError();
+      }
+      let disp: ImmediateOperand | undefined;
+      if (lhs.disp != null && rhs.disp != null) {
+        disp = {
+          type: "BinOpOperand",
+          op: operand.op,
+          lhs: lhs.disp,
+          rhs: rhs.disp,
+        };
+      } else if (lhs.disp != null) {
+        disp = lhs.disp;
+      } else if (rhs.disp != null) {
+        if (operand.op === "-") {
+          disp = {
+            type: "UnOpOperand",
+            op: "-",
+            arg: rhs.disp,
+          };
+        } else {
+          disp = rhs.disp;
+        }
+      } else {
+        throw new StructuredInstructionParseError();
+      }
+      return {
+        type: "MemoryOperand",
+        baseReg: lhs.baseReg ?? rhs.baseReg,
+        indexReg: lhs.indexReg ?? rhs.indexReg,
+        disp,
+      };
+    }
+  }
+  throw new StructuredInstructionParseError();
+}
+function parseImmediateOperand(operand: Operand): ImmediateOperand {
+  switch (operand.type) {
+    case "VariableOperand":
+    case "IntegerOperand":
+    case "StringOperand":
+      return operand;
+    case "UnOpOperand":
+      return {
+        type: "UnOpOperand",
+        op: operand.op,
+        arg: parseImmediateOperand(operand.arg),
+      };
+    case "BinOpOperand":
+      return {
+        type: "BinOpOperand",
+        op: operand.op,
+        lhs: parseImmediateOperand(operand.lhs),
+        rhs: parseImmediateOperand(operand.rhs),
+      };
+  }
+  throw new StructuredInstructionParseError();
+}
+
 function stringifyInstruction(instruction: Instruction): string {
-  let text = instruction.mnemonic;
-  if (instruction.operands.length > 0) {
+  let mnemonic: string;
+  let operands: OperandExt[];
+  switch (instruction.type) {
+    case "Instruction":
+      mnemonic = instruction.mnemonic;
+      operands = instruction.operands;
+      break;
+    case "MovInstruction":
+      mnemonic = "mov";
+      operands = [instruction.dest, instruction.src];
+      break;
+  }
+  let text = mnemonic;
+  if (operands.length > 0) {
     text += " ";
-    text += instruction.operands.map((operand) => stringifyOperand(operand)).join(", ");
+    text += operands.map((operand) => stringifyOperand(operand)).join(", ");
   }
   return text;
 }
 
-function stringifyOperand(operand: Operand, level = 2): string {
+function stringifyOperand(operand: OperandExt, level = 2): string {
   let innerLevel = 0;
   switch (operand.type) {
     case "VariableOperand":
     case "RegisterOperand":
     case "IntegerOperand":
+    case "StringOperand":
     case "IndirectOperand":
+    case "MemoryOperand":
       innerLevel = 1;
       break;
     case "BinOpOperand":
@@ -387,7 +630,7 @@ function stringifyOperand(operand: Operand, level = 2): string {
     return `(${stringifyOperandNoParen(operand)})`;
   }
 }
-function stringifyOperandNoParen(operand: Operand): string {
+function stringifyOperandNoParen(operand: OperandExt): string {
   switch (operand.type) {
     case "VariableOperand":
       return operand.name;
@@ -395,8 +638,27 @@ function stringifyOperandNoParen(operand: Operand): string {
       return operand.reg;
     case "IntegerOperand":
       return operand.base === 16 ? `${operand.digits}H` : operand.digits;
+    case "StringOperand":
+      if (operand.text.includes('"')) {
+        return `'${operand.text}'`;
+      } else {
+        return `"${operand.text}"`;
+      }
     case "IndirectOperand":
       return `[${stringifyOperand(operand.address, 2)}]`;
+    case "MemoryOperand": {
+      const components: string[] = [];
+      if (operand.baseReg) {
+        components.push(operand.baseReg);
+      }
+      if (operand.indexReg) {
+        components.push(operand.indexReg);
+      }
+      if (operand.disp) {
+        components.push(stringifyOperand(operand.disp, 1));
+      }
+      return `[${components.join(" + ")}]`;
+    }
     case "BinOpOperand":
       return `${stringifyOperand(operand.lhs, 2)} ${operand.op} ${stringifyOperand(operand.rhs, 1)}`;
     case "UnOpOperand":
@@ -458,6 +720,8 @@ function stringifyOperandAsCNoParen(operand: Operand): [string, number] {
       return [operand.reg, 1];
     case "IntegerOperand":
       return [operand.base === 16 ? `0x${operand.digits}` : operand.digits.replace(/^0+(?=[1-9])/, ""), 1];
+    case "StringOperand":
+      return [`'${escapeC(operand.text[0])}'`, 1];
     case "IndirectOperand":
       return [`[${stringifyOperandAsC(operand, 2)}]`, 1];
     case "BinOpOperand":
@@ -477,7 +741,7 @@ function analyzeLabels(lines: (Label | Instruction)[]): [Instruction[], Map<stri
   for (const line of lines) {
     if (line.type === "Label") {
       pendingLabels.push(line);
-    } else if (line.type === "Instruction") {
+    } else {
       for (const label of pendingLabels) {
         labels.set(label.name, instructions.length);
       }
@@ -517,112 +781,111 @@ function analyzeWrites(instructions: Instruction[], labels: Map<string, number>)
       const writeData = writesFrom[i];
       const nextWriteData: WriteData = i + 1 < instructions.length ? writesFrom[i + 1] : emptyWriteData();
       let newWriteData: WriteData | undefined = undefined;
-      switch (instruction.mnemonic) {
-        case "mov": {
-          const dest = instruction.operands[0] && asRegister(instruction.operands[0]);
-          if (dest === "sp") {
-            newWriteData = emptyWriteData();
+      if (instruction.type === "MovInstruction") {
+        const { dest, src } = instruction;
+        if (dest.type === "RegisterOperand" && dest.reg === "sp") {
+          newWriteData = emptyWriteData();
+        }
+        if (dest.type === "RegisterOperand" && dest.reg !== "sp" && src.type === "RegisterOperand") {
+          const mapping: SeqWritesMapping = {};
+          for (const reg of expandAliases(new Set([dest.reg]))) {
+            mapping[reg] = "any";
           }
-          const src = instruction.operands[1] && asRegister(instruction.operands[1]);
-          if (dest && src && dest !== "sp") {
-            const mapping: SeqWritesMapping = {};
-            for (const reg of expandAliases(new Set([dest]))) {
-              mapping[reg] = "any";
+          mapping[dest.reg] = src.reg;
+          for (const [key, destSub] of Object.entries(SUB_REGS.get(dest.reg) ?? {})) {
+            const srcSub = SUB_REGS.get(src.reg)?.[key];
+            if (srcSub) {
+              mapping[destSub] = srcSub;
             }
-            mapping[dest] = src;
-            for (const [key, destSub] of Object.entries(SUB_REGS.get(dest) ?? {})) {
-              const srcSub = SUB_REGS.get(src)?.[key];
-              if (srcSub) {
-                mapping[destSub] = srcSub;
+          }
+          newWriteData = seqWrites(nextWriteData, mapping);
+        }
+      } else if (instruction.type === "Instruction") {
+        switch (instruction.mnemonic) {
+          case "xchg":
+            break;
+          case "push": {
+            const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+            newWriteData = popWrites(nextWriteData, 2, reg);
+            break;
+          }
+          case "pop": {
+            const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+            if (reg) {
+              newWriteData = seqWrites(pushWrites(nextWriteData, 2), {
+                [reg]: {
+                  type: "StackAlias",
+                  index: 0,
+                  size: 2,
+                },
+              });
+            } else {
+              newWriteData = pushWrites(nextWriteData, 2);
+            }
+            break;
+          }
+          case "ret":
+            newWriteData = retWriteData(i);
+            break;
+          case "jp": // Considered an unconditional jump here
+          case "jmp":
+          case "jmps":
+            if (instruction.operands.length === 1) {
+              const target = instruction.operands[0];
+              if (target.type === "VariableOperand") {
+                const targetIndex = labels.get(target.name);
+                if (targetIndex !== undefined) {
+                  newWriteData = writesFrom[targetIndex];
+                }
               }
             }
-            newWriteData = seqWrites(nextWriteData, mapping);
-          }
-          break;
-        }
-        case "xchg":
-          break;
-        case "push": {
-          const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
-          newWriteData = popWrites(nextWriteData, 2, reg);
-          break;
-        }
-        case "pop": {
-          const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
-          if (reg) {
-            newWriteData = seqWrites(pushWrites(nextWriteData, 2), {
-              [reg]: {
-                type: "StackAlias",
-                index: 0,
-                size: 2,
-              },
-            });
-          } else {
-            newWriteData = pushWrites(nextWriteData, 2);
-          }
-          break;
-        }
-        case "ret":
-          newWriteData = retWriteData(i);
-          break;
-        case "jp": // Considered an unconditional jump here
-        case "jmp":
-        case "jmps":
-          if (instruction.operands.length === 1) {
-            const target = instruction.operands[0];
-            if (target.type === "VariableOperand") {
-              const targetIndex = labels.get(target.name);
-              if (targetIndex !== undefined) {
-                newWriteData = writesFrom[targetIndex];
+            break;
+          case "ja":
+          case "jna":
+          case "jbe":
+          case "jnbe":
+          case "jg":
+          case "jng":
+          case "jle":
+          case "jnle":
+          case "jge":
+          case "jnge":
+          case "jl":
+          case "jnl":
+          case "jo":
+          case "jno":
+          case "js":
+          case "jns":
+          case "je":
+          case "jne":
+          case "jz":
+          case "jnz":
+          // case "jp":
+          case "jnp":
+          case "jpe":
+          case "jpo":
+          case "jae":
+          case "jnae":
+          case "jb":
+          case "jnb":
+          case "jc":
+          case "jnc": {
+            if (instruction.operands.length === 1) {
+              const target = instruction.operands[0];
+              if (target.type === "VariableOperand") {
+                const targetIndex = labels.get(target.name);
+                if (targetIndex !== undefined) {
+                  newWriteData = mergeWrites(nextWriteData, writesFrom[targetIndex]);
+                }
               }
             }
+            break;
           }
-          break;
-        case "ja":
-        case "jna":
-        case "jbe":
-        case "jnbe":
-        case "jg":
-        case "jng":
-        case "jle":
-        case "jnle":
-        case "jge":
-        case "jnge":
-        case "jl":
-        case "jnl":
-        case "jo":
-        case "jno":
-        case "js":
-        case "jns":
-        case "je":
-        case "jne":
-        case "jz":
-        case "jnz":
-        // case "jp":
-        case "jnp":
-        case "jpe":
-        case "jpo":
-        case "jae":
-        case "jnae":
-        case "jb":
-        case "jnb":
-        case "jc":
-        case "jnc": {
-          if (instruction.operands.length === 1) {
-            const target = instruction.operands[0];
-            if (target.type === "VariableOperand") {
-              const targetIndex = labels.get(target.name);
-              if (targetIndex !== undefined) {
-                newWriteData = mergeWrites(nextWriteData, writesFrom[targetIndex]);
-              }
-            }
-          }
-          break;
+          case "call":
+            break;
+          case "int":
+            break;
         }
-        case "call":
-          break;
-        case "int":
-          break;
       }
       if (!newWriteData) {
         const mapping: SeqWritesMapping = {};
@@ -823,68 +1086,72 @@ function markFunctions(instructions: Instruction[], labels: Map<string, number>,
       labelGraph.set(i, []);
     }
     const instruction = instructions[i];
-    switch (instruction.mnemonic) {
-      case "ret":
-        lastLabel = undefined;
-        break;
-      case "jp": // Considered an unconditional jump here
-      case "jmp":
-      case "jmps":
-        if (instruction.operands.length === 1) {
-          const target = instruction.operands[0];
-          if (target.type === "VariableOperand") {
-            const targetIndex = labels.get(target.name);
-            if (targetIndex !== undefined) {
-              if (lastLabel !== undefined) {
-                labelGraph.get(lastLabel)!.push(targetIndex);
+    if (instruction.type === "MovInstruction") {
+      //
+    } else {
+      switch (instruction.mnemonic) {
+        case "ret":
+          lastLabel = undefined;
+          break;
+        case "jp": // Considered an unconditional jump here
+        case "jmp":
+        case "jmps":
+          if (instruction.operands.length === 1) {
+            const target = instruction.operands[0];
+            if (target.type === "VariableOperand") {
+              const targetIndex = labels.get(target.name);
+              if (targetIndex !== undefined) {
+                if (lastLabel !== undefined) {
+                  labelGraph.get(lastLabel)!.push(targetIndex);
+                }
               }
             }
           }
-        }
-        lastLabel = undefined;
-        break;
-      case "ja":
-      case "jna":
-      case "jbe":
-      case "jnbe":
-      case "jg":
-      case "jng":
-      case "jle":
-      case "jnle":
-      case "jge":
-      case "jnge":
-      case "jl":
-      case "jnl":
-      case "jo":
-      case "jno":
-      case "js":
-      case "jns":
-      case "je":
-      case "jne":
-      case "jz":
-      case "jnz":
-      // case "jp":
-      case "jnp":
-      case "jpe":
-      case "jpo":
-      case "jae":
-      case "jnae":
-      case "jb":
-      case "jnb":
-      case "jc":
-      case "jnc": {
-        if (instruction.operands.length === 1) {
-          const target = instruction.operands[0];
-          if (target.type === "VariableOperand") {
-            const targetIndex = labels.get(target.name);
-            if (targetIndex !== undefined) {
-              if (lastLabel !== undefined) {
-                labelGraph.get(lastLabel)!.push(targetIndex);
+          lastLabel = undefined;
+          break;
+        case "ja":
+        case "jna":
+        case "jbe":
+        case "jnbe":
+        case "jg":
+        case "jng":
+        case "jle":
+        case "jnle":
+        case "jge":
+        case "jnge":
+        case "jl":
+        case "jnl":
+        case "jo":
+        case "jno":
+        case "js":
+        case "jns":
+        case "je":
+        case "jne":
+        case "jz":
+        case "jnz":
+        // case "jp":
+        case "jnp":
+        case "jpe":
+        case "jpo":
+        case "jae":
+        case "jnae":
+        case "jb":
+        case "jnb":
+        case "jc":
+        case "jnc": {
+          if (instruction.operands.length === 1) {
+            const target = instruction.operands[0];
+            if (target.type === "VariableOperand") {
+              const targetIndex = labels.get(target.name);
+              if (targetIndex !== undefined) {
+                if (lastLabel !== undefined) {
+                  labelGraph.get(lastLabel)!.push(targetIndex);
+                }
               }
             }
           }
+          break;
         }
-        break;
       }
     }
   }
@@ -892,7 +1159,7 @@ function markFunctions(instructions: Instruction[], labels: Map<string, number>,
   const functionEntries: Set<number> = new Set();
   for (let i = 0; i < instructions.length; i++) {
     const instruction = instructions[i];
-    if (instruction.mnemonic === "call" && instruction.operands.length === 1) {
+    if (instruction.type === "Instruction" && instruction.mnemonic === "call" && instruction.operands.length === 1) {
       const target = instruction.operands[0];
       if (target.type === "VariableOperand") {
         const targetIndex = labels.get(target.name);
@@ -969,7 +1236,7 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
     }
     for (let i = 0; i < instructions.length; i++) {
       const instruction = instructions[i];
-      if (instruction.mnemonic === "call" && instruction.operands.length === 1) {
+      if (instruction.type === "Instruction" && instruction.mnemonic === "call" && instruction.operands.length === 1) {
         const target = instruction.operands[0];
         if (target.type === "VariableOperand") {
           const targetIndex = labels.get(target.name);
@@ -1014,128 +1281,129 @@ function analyzeLiveness(instructions: Instruction[], labels: Map<string, number
       const livenessHere = livenessTable[i];
       const livenessNext: InstructionLiveness = i + 1 < instructions.length ? livenessTable[i + 1] : { liveBefore: new Set() };
       let newLiveness: InstructionLiveness | undefined = undefined;
-      switch (instruction.mnemonic) {
-        case "mov": {
-          break;
-        }
-        // case "xchg":
-        //   break;
-        // case "push": {
-        //   const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
-        //   newWriteData = popWrites(nextWriteData, 2, reg);
-        //   break;
-        // }
-        // case "pop": {
-        //   const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
-        //   if (reg) {
-        //     newWriteData = pushWrites(nextWriteData, 2, {
-        //       [reg]: {
-        //         type: "StackAlias",
-        //         index: 0,
-        //         size: 2,
-        //       },
-        //     });
-        //   } else {
-        //     newWriteData = pushWrites(nextWriteData, 2, {});
-        //   }
-        //   break;
-        // }
-        case "ret":
-          newLiveness = { liveBefore: new Set() };
-          for (const functionEntry of returnOriginMap.get(i) ?? []) {
-            const returnedRegs = functionReturns.get(functionEntry)!;
-            for (const reg of returnedRegs) {
-              newLiveness.liveBefore.add(reg);
+      if (instruction.type === "MovInstruction") {
+        //
+      } else if (instruction.type === "Instruction") {
+        switch (instruction.mnemonic) {
+          // case "xchg":
+          //   break;
+          // case "push": {
+          //   const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+          //   newWriteData = popWrites(nextWriteData, 2, reg);
+          //   break;
+          // }
+          // case "pop": {
+          //   const reg = instruction.operands[0] && asRegister(instruction.operands[0]);
+          //   if (reg) {
+          //     newWriteData = pushWrites(nextWriteData, 2, {
+          //       [reg]: {
+          //         type: "StackAlias",
+          //         index: 0,
+          //         size: 2,
+          //       },
+          //     });
+          //   } else {
+          //     newWriteData = pushWrites(nextWriteData, 2, {});
+          //   }
+          //   break;
+          // }
+          case "ret":
+            newLiveness = { liveBefore: new Set() };
+            for (const functionEntry of returnOriginMap.get(i) ?? []) {
+              const returnedRegs = functionReturns.get(functionEntry)!;
+              for (const reg of returnedRegs) {
+                newLiveness.liveBefore.add(reg);
+              }
             }
-          }
-          break;
-        case "jp": // Considered an unconditional jump here
-        case "jmp":
-        case "jmps":
-        case "call":
-          if (instruction.operands.length === 1) {
-            const target = instruction.operands[0];
-            if (target.type === "VariableOperand") {
-              const targetIndex = labels.get(target.name);
-              if (targetIndex !== undefined) {
-                if (instruction.mnemonic === "call") {
-                  const functionWrites = new Set(writesFrom[targetIndex].writes.keys());
-                  const preservedRegs = livenessNext.liveBefore.difference(functionWrites);
-                  newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore.union(preservedRegs) };
-                } else {
-                  newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore };
+            break;
+          case "jp": // Considered an unconditional jump here
+          case "jmp":
+          case "jmps":
+          case "call":
+            if (instruction.operands.length === 1) {
+              const target = instruction.operands[0];
+              if (target.type === "VariableOperand") {
+                const targetIndex = labels.get(target.name);
+                if (targetIndex !== undefined) {
+                  if (instruction.mnemonic === "call") {
+                    const functionWrites = new Set(writesFrom[targetIndex].writes.keys());
+                    const preservedRegs = livenessNext.liveBefore.difference(functionWrites);
+                    newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore.union(preservedRegs) };
+                  } else {
+                    newLiveness = { liveBefore: livenessTable[targetIndex].liveBefore };
+                  }
                 }
               }
             }
-          }
-          break;
-        case "ja":
-        case "jna":
-        case "jbe":
-        case "jnbe":
-        case "jg":
-        case "jng":
-        case "jle":
-        case "jnle":
-        case "jge":
-        case "jnge":
-        case "jl":
-        case "jnl":
-        case "jo":
-        case "jno":
-        case "js":
-        case "jns":
-        case "je":
-        case "jne":
-        case "jz":
-        case "jnz":
-        // case "jp":
-        case "jnp":
-        case "jpe":
-        case "jpo":
-        case "jae":
-        case "jnae":
-        case "jb":
-        case "jnb":
-        case "jc":
-        case "jnc": {
-          newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
-          // Check condition flags
-          const [src] = instructionIO(instruction);
-          for (const reg of src) {
-            newLiveness.liveBefore.add(reg);
-          }
+            break;
+          case "ja":
+          case "jna":
+          case "jbe":
+          case "jnbe":
+          case "jg":
+          case "jng":
+          case "jle":
+          case "jnle":
+          case "jge":
+          case "jnge":
+          case "jl":
+          case "jnl":
+          case "jo":
+          case "jno":
+          case "js":
+          case "jns":
+          case "je":
+          case "jne":
+          case "jz":
+          case "jnz":
+          // case "jp":
+          case "jnp":
+          case "jpe":
+          case "jpo":
+          case "jae":
+          case "jnae":
+          case "jb":
+          case "jnb":
+          case "jc":
+          case "jnc": {
+            newLiveness = { liveBefore: new Set(livenessNext.liveBefore) };
+            // Check condition flags
+            const [src] = instructionIO(instruction);
+            for (const reg of src) {
+              newLiveness.liveBefore.add(reg);
+            }
 
-          if (instruction.operands.length === 1) {
-            const target = instruction.operands[0];
-            if (target.type === "VariableOperand") {
-              const targetIndex = labels.get(target.name);
-              if (targetIndex !== undefined) {
-                for (const reg of livenessTable[targetIndex].liveBefore) {
-                  newLiveness.liveBefore.add(reg);
-                }
-              } else if (/^ret$/i.test(target.name)) {
-                // Jcc RET ... specially handled by ASM
-                // TODO: integrate logic with RET
-                for (const functionEntry of returnOriginMap.get(i) ?? []) {
-                  const functionWrites = new Set(writesFrom[functionEntry].writes.keys());
-                  for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
-                    if (callIndex + 1 >= instructions.length) {
-                      continue;
-                    }
-                    const innerLiveness = livenessTable[callIndex + 1].liveBefore.intersection(functionWrites);
-                    for (const reg of innerLiveness) {
-                      newLiveness.liveBefore.add(reg);
+            if (instruction.operands.length === 1) {
+              const target = instruction.operands[0];
+              if (target.type === "VariableOperand") {
+                const targetIndex = labels.get(target.name);
+                if (targetIndex !== undefined) {
+                  for (const reg of livenessTable[targetIndex].liveBefore) {
+                    newLiveness.liveBefore.add(reg);
+                  }
+                } else if (/^ret$/i.test(target.name)) {
+                  // Jcc RET ... specially handled by ASM
+                  // TODO: integrate logic with RET
+                  for (const functionEntry of returnOriginMap.get(i) ?? []) {
+                    const functionWrites = new Set(writesFrom[functionEntry].writes.keys());
+                    for (const callIndex of callOriginMap.get(functionEntry) ?? []) {
+                      if (callIndex + 1 >= instructions.length) {
+                        continue;
+                      }
+                      const innerLiveness = livenessTable[callIndex + 1].liveBefore.intersection(functionWrites);
+                      for (const reg of innerLiveness) {
+                        newLiveness.liveBefore.add(reg);
+                      }
                     }
                   }
                 }
               }
             }
+            break;
           }
-          break;
+          // case "int":
+          //   break;
         }
-        // case "int":
-        //   break;
       }
       if (!newLiveness) {
         newLiveness = { liveBefore: decomposeCoverings(livenessNext.liveBefore) };
@@ -1261,7 +1529,48 @@ function instructionIO(inst: Instruction): [Set<string>, Set<string>] {
   return [new Set(dest), new Set(src)];
 }
 function instructionIOImpl(inst: Instruction): [string[], string[]] {
-  function dest(inst: Instruction): string[] {
+  function operandAsDest(op: RegisterOperand | MemoryOperand | ImmediateOperand): string[] {
+    if (op.type === "RegisterOperand") {
+      return [op.reg];
+    } else {
+      return [];
+    }
+  }
+  function operandAsSrc(op: OperandExt): string[] {
+    const set: Set<string> = new Set();
+    search(op);
+    function search(op: OperandExt) {
+      switch (op.type) {
+        case "RegisterOperand":
+          set.add(op.reg);
+          break;
+        case "IndirectOperand":
+          search(op.address);
+          break;
+        case "MemoryOperand":
+          if (op.baseReg != null) {
+            set.add(op.baseReg);
+          }
+          if (op.indexReg != null) {
+            set.add(op.indexReg);
+          }
+          if (op.disp) {
+            search(op.disp);
+          }
+          break;
+        case "BinOpOperand":
+          search(op.lhs);
+          search(op.rhs);
+          break;
+        case "UnOpOperand":
+          search(op.arg);
+          break;
+      }
+    }
+    return Array.from(set);
+  }
+
+  function dest(inst: GenericInstruction): string[] {
     if (inst.operands.length === 0) {
       return [];
     }
@@ -1271,7 +1580,7 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
     }
     return [];
   }
-  function src(inst: Instruction): string[] {
+  function src(inst: GenericInstruction): string[] {
     const deps: Set<string> = new Set();
     for (const op of inst.operands) {
       search(op);
@@ -1290,200 +1599,200 @@ function instructionIOImpl(inst: Instruction): [string[], string[]] {
     }
     return Array.from(deps.keys());
   }
-  function isSelfOp(inst: Instruction): boolean {
+  function isSelfOp(inst: GenericInstruction): boolean {
     if (inst.operands.length !== 2) {
       return false;
     }
     const [dest, src] = inst.operands;
     return dest.type === "RegisterOperand" && src.type === "RegisterOperand" && dest.reg === src.reg;
   }
-  switch (inst.mnemonic) {
-    case "add":
-    case "sub":
-    case "and":
-    case "or":
-    case "xor":
-    case "neg":
-      if (isSelfOp(inst) && (inst.mnemonic === "and" || inst.mnemonic === "or")) {
+  if (inst.type === "MovInstruction") {
+    const { dest, src } = inst;
+    return [operandAsSrc(src), operandAsDest(dest)];
+  } else {
+    switch (inst.mnemonic) {
+      case "add":
+      case "sub":
+      case "and":
+      case "or":
+      case "xor":
+      case "neg":
+        if (isSelfOp(inst) && (inst.mnemonic === "and" || inst.mnemonic === "or")) {
+          return [[...src(inst)], ["flags"]];
+        }
+        if (isSelfOp(inst) && inst.mnemonic === "xor") {
+          return [[], [...dest(inst), "flags"]];
+        }
+        return [[...src(inst)], [...dest(inst), "flags"]]
+      case "adc":
+      case "sbb":
+        return [[...src(inst), "cf"], [...dest(inst), "flags"]];
+      case "cmp":
+      case "test":
         return [[...src(inst)], ["flags"]];
-      }
-      if (isSelfOp(inst) && inst.mnemonic === "xor") {
-        return [[], [...dest(inst), "flags"]];
-      }
-      return [[...src(inst)], [...dest(inst), "flags"]]
-    case "adc":
-    case "sbb":
-      return [[...src(inst), "cf"], [...dest(inst), "flags"]];
-    case "cmp":
-    case "test":
-      return [[...src(inst)], ["flags"]];
-    case "not":
-      return [[...src(inst)], [...dest(inst)]];
-    case "div":
-    case "mul": {
-      const s = src(inst);
-      const d = dest(inst);
-      const is16bit = s.some((reg) => ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"].includes(reg));
-      if (inst.mnemonic === "div") {
-        if (is16bit) {
-          return [[...s, "ax", "dx"], [...d, "ax", "dx", "flags"]];
+      case "not":
+        return [[...src(inst)], [...dest(inst)]];
+      case "div":
+      case "mul": {
+        const s = src(inst);
+        const d = dest(inst);
+        const is16bit = s.some((reg) => ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di"].includes(reg));
+        if (inst.mnemonic === "div") {
+          if (is16bit) {
+            return [[...s, "ax", "dx"], [...d, "ax", "dx", "flags"]];
+          } else {
+            return [[...s, "al", "ah"], [...d, "al", "ah", "flags"]];
+          }
         } else {
-          return [[...s, "al", "ah"], [...d, "al", "ah", "flags"]];
-        }
-      } else {
-        if (is16bit) {
-          return [[...s, "ax"], [...d, "ax", "dx", "flags"]];
-        } else {
-          return [[...s, "al"], [...d, "al", "ah", "flags"]];
+          if (is16bit) {
+            return [[...s, "ax"], [...d, "ax", "dx", "flags"]];
+          } else {
+            return [[...s, "al"], [...d, "al", "ah", "flags"]];
+          }
         }
       }
-    }
-    case "aam":
-      return [["al"], ["al", "ah", "flags"]];
-    case "call":
-      // Should be handled by the caller
-      return [[], []];
-    case "cbw":
-      return [["al"], ["al", "ah"]];
-    case "cmc":
-      return [["cf"], ["cf"]];
-    case "cmpb":
-      // CMPSB
-      return [["si", "di"], ["flags"]];
-    case "dec":
-    case "inc":
-      return [[...src(inst)], [...dest(inst), "of", "sf", "zf", "af", "pf"]];
-    case "int":
-      // Should be handled by the caller
-      return [[], []];
-    case "jp": // Considered an unconditional jump here
-    case "jmp":
-    case "jmps":
-      // Should be handled by the caller
-      return [[], []];
-    case "ja":
-    case "jna":
-    case "jbe":
-    case "jnbe":
-      return [["cf", "zf"], []];
-    case "jg":
-    case "jng":
-    case "jle":
-    case "jnle":
-      return [["of", "sf", "zf"], []];
-    case "jge":
-    case "jnge":
-    case "jl":
-    case "jnl":
-      return [["of", "sf"], []];
-    case "jo":
-    case "jno":
-      return [["of"], []];
-    case "js":
-    case "jns":
-      return [["sf"], []];
-    case "je":
-    case "jne":
-    case "jz":
-    case "jnz":
-      return [["zf"], []];
-    // case "jp":
-    case "jnp":
-    case "jpe":
-    case "jpo":
-      return [["pf"], []];
-    case "jae":
-    case "jnae":
-    case "jb":
-    case "jnb":
-    case "jc":
-    case "jnc":
-      return [["cf"], []];
-    case "lahf":
-      return [["sf", "zf", "af", "pf", "cf"], ["ah"]];
-    case "sahf":
-      return [["ah"], ["sf", "zf", "af", "pf", "cf"]];
-    case "lodb":
-      // LODSB
-      return [["si"], ["al"]];
-    case "lodw":
-      // LODSW
-      return [["si"], ["ax"]];
-    case "loop":
-      return [["cx"], ["cx"]];
-    case "mov": {
-      const dest = inst.operands[0] && asRegister(inst.operands[0]);
-      const src = inst.operands[1] && asRegister(inst.operands[1]);
-      return [src ? [src] : [], dest ? [dest] : []]
-    }
-    case "xchg":
-      if (isSelfOp(inst)) {
-        // nop
+      case "aam":
+        return [["al"], ["al", "ah", "flags"]];
+      case "call":
+        // Should be handled by the caller
         return [[], []];
-      }
-      // TODO: special handling for multiple sources
-      return [[...src(inst)], [...dest(inst), "flags"]]
-    case "movb":
-      // MOVSB
-      return [["si", "di"], []];
-    case "movw":
-      // MOVSW
-      return [["si", "di"], []];
-    case "pop":
-      return [["sp"], ["sp", ...dest(inst)]];
-    case "push":
-      return [["sp", ...src(inst)], ["sp"]];
-    case "rcl":
-    case "rcr":
-      return [[...src(inst), "cf"], [...dest(inst), "cf", "of"]];
-    case "rol":
-    case "ror":
-      return [[...src(inst)], [...dest(inst), "cf", "of"]];
-    case "rep":
-    case "repe":
-    case "repne":
-    case "repnz":
-      // TODO
-      return [[], []];
-    case "ret":
-      return [["sp"], ["sp"]];
-    case "scab":
-    case "scasb":
-      // SCASB
-      return [["al", "di"], ["flags"]];
-    case "shl":
-    case "shr":
-      return [[...src(inst)], [...dest(inst), "flags"]];
-    case "stc":
-    case "clc":
-      return [[], ["cf"]];
-    case "cld":
-    case "std":
-    case "down":
-    case "up":
-      // UP = CLD
-      // DOWN = STD
-      return [[], ["cd"]];
-    case "stob":
-      // STOSB
-      return [["al", "di"], []];
-    case "stow":
-      // STOSW
-      return [["ax", "di"], []];
-    case "xlat":
-      return [["al", "bx"], ["al"]];
-    case "align":
-    case "db":
-    case "dw":
-    case "ds":
-    case "dm":
-    case "equ":
-    case "org":
-    case "put":
-      return [[], []];
-    default:
-      console.log("instructionIO: Unknown mnemonic", inst.mnemonic);
-      return [[], []];
+      case "cbw":
+        return [["al"], ["al", "ah"]];
+      case "cmc":
+        return [["cf"], ["cf"]];
+      case "cmpb":
+        // CMPSB
+        return [["si", "di"], ["flags"]];
+      case "dec":
+      case "inc":
+        return [[...src(inst)], [...dest(inst), "of", "sf", "zf", "af", "pf"]];
+      case "int":
+        // Should be handled by the caller
+        return [[], []];
+      case "jp": // Considered an unconditional jump here
+      case "jmp":
+      case "jmps":
+        // Should be handled by the caller
+        return [[], []];
+      case "ja":
+      case "jna":
+      case "jbe":
+      case "jnbe":
+        return [["cf", "zf"], []];
+      case "jg":
+      case "jng":
+      case "jle":
+      case "jnle":
+        return [["of", "sf", "zf"], []];
+      case "jge":
+      case "jnge":
+      case "jl":
+      case "jnl":
+        return [["of", "sf"], []];
+      case "jo":
+      case "jno":
+        return [["of"], []];
+      case "js":
+      case "jns":
+        return [["sf"], []];
+      case "je":
+      case "jne":
+      case "jz":
+      case "jnz":
+        return [["zf"], []];
+      // case "jp":
+      case "jnp":
+      case "jpe":
+      case "jpo":
+        return [["pf"], []];
+      case "jae":
+      case "jnae":
+      case "jb":
+      case "jnb":
+      case "jc":
+      case "jnc":
+        return [["cf"], []];
+      case "lahf":
+        return [["sf", "zf", "af", "pf", "cf"], ["ah"]];
+      case "sahf":
+        return [["ah"], ["sf", "zf", "af", "pf", "cf"]];
+      case "lodb":
+        // LODSB
+        return [["si"], ["al"]];
+      case "lodw":
+        // LODSW
+        return [["si"], ["ax"]];
+      case "loop":
+        return [["cx"], ["cx"]];
+      case "xchg":
+        if (isSelfOp(inst)) {
+          // nop
+          return [[], []];
+        }
+        // TODO: special handling for multiple sources
+        return [[...src(inst)], [...dest(inst), "flags"]]
+      case "movb":
+        // MOVSB
+        return [["si", "di"], []];
+      case "movw":
+        // MOVSW
+        return [["si", "di"], []];
+      case "pop":
+        return [["sp"], ["sp", ...dest(inst)]];
+      case "push":
+        return [["sp", ...src(inst)], ["sp"]];
+      case "rcl":
+      case "rcr":
+        return [[...src(inst), "cf"], [...dest(inst), "cf", "of"]];
+      case "rol":
+      case "ror":
+        return [[...src(inst)], [...dest(inst), "cf", "of"]];
+      case "rep":
+      case "repe":
+      case "repne":
+      case "repnz":
+        // TODO
+        return [[], []];
+      case "ret":
+        return [["sp"], ["sp"]];
+      case "scab":
+      case "scasb":
+        // SCASB
+        return [["al", "di"], ["flags"]];
+      case "shl":
+      case "shr":
+        return [[...src(inst)], [...dest(inst), "flags"]];
+      case "stc":
+      case "clc":
+        return [[], ["cf"]];
+      case "cld":
+      case "std":
+      case "down":
+      case "up":
+        // UP = CLD
+        // DOWN = STD
+        return [[], ["cd"]];
+      case "stob":
+        // STOSB
+        return [["al", "di"], []];
+      case "stow":
+        // STOSW
+        return [["ax", "di"], []];
+      case "xlat":
+        return [["al", "bx"], ["al"]];
+      case "align":
+      case "db":
+      case "dw":
+      case "ds":
+      case "dm":
+      case "equ":
+      case "org":
+      case "put":
+        return [[], []];
+      default:
+        console.log(`instructionIO: Unknown mnemonic, line ${inst.lineMetadata.line},`, inst.mnemonic);
+        return [[], []];
+    }
   }
 }
 function asRegister(operand: Operand): string | undefined {
